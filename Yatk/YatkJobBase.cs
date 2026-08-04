@@ -11,6 +11,7 @@ public abstract class YatkJobBase
     private DateTimeOffset? startedAt;
     private DateTimeOffset? completedAt;
     private Exception? exception;
+    private readonly TaskCompletionSource completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>
     /// ジョブを初期化します。
@@ -109,6 +110,7 @@ public abstract class YatkJobBase
 
             state = YatkJobState.Canceled;
             completedAt = timestamp;
+            completion.TrySetResult();
             return true;
         }
     }
@@ -124,6 +126,7 @@ public abstract class YatkJobBase
 
             state = YatkJobState.Canceled;
             completedAt = timestamp;
+            completion.TrySetResult();
             return true;
         }
     }
@@ -134,6 +137,7 @@ public abstract class YatkJobBase
         {
             state = YatkJobState.Succeeded;
             completedAt = timestamp;
+            completion.TrySetResult();
         }
     }
 
@@ -144,12 +148,18 @@ public abstract class YatkJobBase
             state = YatkJobState.Failed;
             completedAt = timestamp;
             exception = error;
+            completion.TrySetResult();
         }
     }
 
     internal Task ExecuteInternalAsync(CancellationToken cancellationToken)
     {
         return ExecuteAsync(cancellationToken);
+    }
+
+    internal Task WaitForCompletionAsync(CancellationToken cancellationToken)
+    {
+        return completion.Task.WaitAsync(cancellationToken);
     }
 
     internal YatkJobSnapshot CreateSnapshot()

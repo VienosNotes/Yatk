@@ -145,6 +145,29 @@ public sealed class YatkScheduler : IAsyncDisposable
     }
 
     /// <summary>
+    /// 指定したジョブが終了状態になるまで待機します。
+    /// </summary>
+    /// <param name="jobId">待機するジョブの ID です。</param>
+    /// <param name="cancellationToken">待機のみを中断するためのトークンです。</param>
+    /// <returns>待機処理を表すタスクです。</returns>
+    /// <exception cref="KeyNotFoundException">指定したジョブが存在しない場合に発生します。</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> により待機が中断された場合に発生します。</exception>
+    public async Task WaitForCompletionAsync(YatkJobId jobId, CancellationToken cancellationToken = default)
+    {
+        JobEntry entry;
+
+        lock (syncRoot)
+        {
+            if (!jobs.TryGetValue(jobId, out entry))
+            {
+                throw new KeyNotFoundException("指定したジョブは登録されていません。");
+            }
+        }
+
+        await entry.Job.WaitForCompletionAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 新規投入を終了し、キューにあるジョブと実行中ジョブの終了を待機します。
     /// </summary>
     /// <returns>破棄処理を表す値です。</returns>

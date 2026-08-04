@@ -4,6 +4,7 @@ namespace Yatk.Tests;
 
 public sealed class YatkSchedulerTests
 {
+    // ラムダジョブが実行されることを確認する。
     [Fact]
     public async Task Do_ExecutesLambdaJob()
     {
@@ -19,6 +20,7 @@ public sealed class YatkSchedulerTests
         await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    // YatkJobBase 派生ジョブが実行されることを確認する。
     [Fact]
     public async Task Enqueue_ExecutesRichJob()
     {
@@ -30,6 +32,7 @@ public sealed class YatkSchedulerTests
         await job.Completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    // 最大並列度が 1 のときにジョブが FIFO 順で開始されることを確認する。
     [Fact]
     public async Task Jobs_AreStartedInFifoOrder_WhenConcurrencyIsOne()
     {
@@ -59,6 +62,7 @@ public sealed class YatkSchedulerTests
         Assert.Equal(new[] { 1, 2 }, started);
     }
 
+    // 実行中ジョブ数が最大並列度を超えないことを確認する。
     [Fact]
     public async Task Jobs_DoNotExceedConfiguredMaxConcurrency()
     {
@@ -90,6 +94,7 @@ public sealed class YatkSchedulerTests
         release.SetResult();
     }
 
+    // 失敗したジョブの後も後続ジョブが実行されることを確認する。
     [Fact]
     public async Task FailedJob_DoesNotPreventLaterJobFromRunning()
     {
@@ -106,6 +111,7 @@ public sealed class YatkSchedulerTests
         await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    // スナップショットにジョブの状態遷移と完了情報が記録されることを確認する。
     [Fact]
     public async Task Enqueue_RecordsLifecycleInSnapshot()
     {
@@ -138,6 +144,7 @@ public sealed class YatkSchedulerTests
         Assert.Null(completed.Exception);
     }
 
+    // 失敗したジョブの例外がスナップショットに記録されることを確認する。
     [Fact]
     public async Task FailedJob_RecordsExceptionInSnapshot()
     {
@@ -153,6 +160,7 @@ public sealed class YatkSchedulerTests
         Assert.NotNull(snapshot.CompletedAt);
     }
 
+    // ジョブ一覧がジョブ実体ではなくスナップショットを返すことを確認する。
     [Fact]
     public async Task GetJobs_ReturnsSnapshotsWithoutJobInstances()
     {
@@ -167,6 +175,7 @@ public sealed class YatkSchedulerTests
         Assert.Equal(jobId, snapshot.JobId);
     }
 
+    // 待機中にキャンセルされたジョブが実行されないことを確認する。
     [Fact]
     public async Task Cancel_DoesNotExecuteQueuedJob()
     {
@@ -197,6 +206,7 @@ public sealed class YatkSchedulerTests
         Assert.NotNull(scheduler.GetJob(jobId)?.CompletedAt);
     }
 
+    // 実行中ジョブへキャンセルトークンが渡り、キャンセル完了として記録されることを確認する。
     [Fact]
     public async Task Cancel_PropagatesTokenAndRecordsCanceled()
     {
@@ -222,6 +232,7 @@ public sealed class YatkSchedulerTests
         Assert.NotNull(snapshot.CompletedAt);
     }
 
+    // キャンセルを無視して正常終了したジョブが成功として記録されることを確認する。
     [Fact]
     public async Task Cancel_IgnoredByJobResultsInSucceeded()
     {
@@ -245,6 +256,7 @@ public sealed class YatkSchedulerTests
         Assert.Equal(YatkJobState.Succeeded, scheduler.GetJob(jobId)?.State);
     }
 
+    // 完了済みまたは未登録のジョブをキャンセルできないことを確認する。
     [Fact]
     public async Task Cancel_ReturnsFalseForCompletedOrUnknownJob()
     {
@@ -255,6 +267,99 @@ public sealed class YatkSchedulerTests
 
         Assert.False(scheduler.Cancel(jobId));
         Assert.False(scheduler.Cancel(new YatkJobId(Guid.NewGuid())));
+    }
+
+    // 正常終了したジョブを完了まで待機できることを確認する。
+    [Fact]
+    public async Task WaitForCompletionAsync_WaitsForSucceededJob()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(async _ =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var waitTask = scheduler.WaitForCompletionAsync(jobId);
+        Assert.False(waitTask.IsCompleted);
+
+        release.SetResult();
+        await waitTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(YatkJobState.Succeeded, scheduler.GetJob(jobId)?.State);
+    }
+
+    // 失敗したジョブでも待機処理自体は正常に完了することを確認する。
+    [Fact]
+    public async Task WaitForCompletionAsync_CompletesForFailedJob()
+    {
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(_ => throw new InvalidOperationException("失敗"));
+
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(YatkJobState.Failed, scheduler.GetJob(jobId)?.State);
+    }
+
+    // キャンセルされたジョブを完了まで待機できることを確認する。
+    [Fact]
+    public async Task WaitForCompletionAsync_CompletesForCanceledJob()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(async cancellationToken =>
+        {
+            started.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(scheduler.Cancel(jobId));
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(YatkJobState.Canceled, scheduler.GetJob(jobId)?.State);
+    }
+
+    // 待機側のキャンセルがジョブ本体をキャンセルしないことを確認する。
+    [Fact]
+    public async Task WaitForCompletionAsync_CancellationOnlyCancelsWaiter()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var cancellationTokenSource = new CancellationTokenSource();
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(async _ =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var waitTask = scheduler.WaitForCompletionAsync(jobId, cancellationTokenSource.Token);
+        cancellationTokenSource.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => waitTask);
+        Assert.Equal(YatkJobState.Running, scheduler.GetJob(jobId)?.State);
+
+        release.SetResult();
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    // 未登録ジョブを待機すると例外になることを確認する。
+    [Fact]
+    public async Task WaitForCompletionAsync_ThrowsForUnknownJob()
+    {
+        await using var scheduler = new YatkScheduler();
+
+        await Assert.ThrowsAsync<KeyNotFoundException>(
+            () => scheduler.WaitForCompletionAsync(new YatkJobId(Guid.NewGuid())));
     }
 
     private sealed class TestJob : YatkJobBase
