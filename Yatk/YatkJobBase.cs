@@ -11,6 +11,8 @@ public abstract class YatkJobBase
     private DateTimeOffset? startedAt;
     private DateTimeOffset? completedAt;
     private Exception? exception;
+    private double? progress;
+    private string? statusMessage;
     private readonly TaskCompletionSource completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>
@@ -49,11 +51,40 @@ public abstract class YatkJobBase
     public string? Name { get; }
 
     /// <summary>
+    /// 最後に報告された進捗を取得します。
+    /// </summary>
+    public double? Progress
+    {
+        get
+        {
+            lock (syncRoot)
+            {
+                return progress;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 最後に設定された状態メッセージを取得します。
+    /// </summary>
+    public string? StatusMessage
+    {
+        get
+        {
+            lock (syncRoot)
+            {
+                return statusMessage;
+            }
+        }
+    }
+
+    /// <summary>
     /// ジョブを非同期で実行します。
     /// </summary>
-    /// <param name="cancellationToken">将来のキャンセル機能のために渡されるトークンです。</param>
+    /// <param name="context">進捗や状態メッセージを報告するためのコンテキストです。</param>
+    /// <param name="cancellationToken">ジョブのキャンセル通知を受け取るトークンです。</param>
     /// <returns>実行処理を表すタスクです。</returns>
-    protected abstract Task ExecuteAsync(CancellationToken cancellationToken);
+    protected abstract Task ExecuteAsync(YatkJobContext context, CancellationToken cancellationToken);
 
     internal bool TryMarkQueued(DateTimeOffset timestamp)
     {
@@ -154,7 +185,23 @@ public abstract class YatkJobBase
 
     internal Task ExecuteInternalAsync(CancellationToken cancellationToken)
     {
-        return ExecuteAsync(cancellationToken);
+        return ExecuteAsync(new YatkJobContext(this), cancellationToken);
+    }
+
+    internal void SetProgress(double value)
+    {
+        lock (syncRoot)
+        {
+            progress = value;
+        }
+    }
+
+    internal void SetStatusMessage(string? message)
+    {
+        lock (syncRoot)
+        {
+            statusMessage = message;
+        }
     }
 
     internal Task WaitForCompletionAsync(CancellationToken cancellationToken)
@@ -170,8 +217,8 @@ public abstract class YatkJobBase
                 JobId,
                 Name,
                 state,
-                Progress: null,
-                StatusMessage: null,
+                progress,
+                statusMessage,
                 queuedAt,
                 startedAt,
                 completedAt,

@@ -175,6 +175,68 @@ public sealed class YatkSchedulerTests
         Assert.Equal(jobId, snapshot.JobId);
     }
 
+    // ジョブコンテキストから報告した進捗と状態メッセージがスナップショットに反映されることを確認する。
+    [Fact]
+    public async Task JobContext_ReportsProgressAndStatusMessage()
+    {
+        await using var scheduler = new YatkScheduler();
+        YatkJobId contextJobId = default;
+
+        var jobId = scheduler.Do((context, _) =>
+        {
+            contextJobId = context.JobId;
+            context.ReportProgress(0.5);
+            context.SetStatusMessage("処理中");
+            return Task.CompletedTask;
+        });
+
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+
+        var snapshot = scheduler.GetJob(jobId);
+        Assert.NotNull(snapshot);
+        Assert.Equal(jobId, contextJobId);
+        Assert.Equal(0.5, snapshot.Progress);
+        Assert.Equal("処理中", snapshot.StatusMessage);
+    }
+
+    // 状態メッセージを null に設定するとスナップショットからクリアされることを確認する。
+    [Fact]
+    public async Task JobContext_ClearsStatusMessageWithNull()
+    {
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do((context, _) =>
+        {
+            context.SetStatusMessage("処理中");
+            context.SetStatusMessage(null);
+            return Task.CompletedTask;
+        });
+
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Null(scheduler.GetJob(jobId)?.StatusMessage);
+    }
+
+    // 範囲外の進捗を報告するとジョブが失敗として記録されることを確認する。
+    [Fact]
+    public async Task JobContext_RejectsOutOfRangeProgress()
+    {
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do((context, _) =>
+        {
+            context.ReportProgress(1.1);
+            return Task.CompletedTask;
+        });
+
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+
+        var snapshot = scheduler.GetJob(jobId);
+        Assert.NotNull(snapshot);
+        Assert.Equal(YatkJobState.Failed, snapshot.State);
+        Assert.IsType<ArgumentOutOfRangeException>(snapshot.Exception);
+    }
+
     // 待機中にキャンセルされたジョブが実行されないことを確認する。
     [Fact]
     public async Task Cancel_DoesNotExecuteQueuedJob()
@@ -366,7 +428,7 @@ public sealed class YatkSchedulerTests
     {
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        protected override Task ExecuteAsync(CancellationToken cancellationToken)
+        protected override Task ExecuteAsync(YatkJobContext context, CancellationToken cancellationToken)
         {
             Completed.SetResult();
             return Task.CompletedTask;

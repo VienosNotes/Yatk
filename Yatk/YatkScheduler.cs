@@ -50,6 +50,21 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(action);
 
+        return Do((_, cancellationToken) => action(cancellationToken), name);
+    }
+
+    /// <summary>
+    /// コンテキストを受け取るラムダ式のジョブをキューへ投入します。
+    /// </summary>
+    /// <param name="action">実行する非同期処理です。</param>
+    /// <param name="name">ジョブを識別する任意の名前です。</param>
+    /// <returns>投入したジョブの ID です。</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="action"/> が <see langword="null"/> の場合に発生します。</exception>
+    /// <exception cref="ObjectDisposedException">スケジューラが破棄済みの場合に発生します。</exception>
+    public YatkJobId Do(Func<YatkJobContext, CancellationToken, Task> action, string? name = null)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+
         var job = new DelegateJob(action, name);
         return Enqueue(job);
     }
@@ -154,11 +169,11 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> により待機が中断された場合に発生します。</exception>
     public async Task WaitForCompletionAsync(YatkJobId jobId, CancellationToken cancellationToken = default)
     {
-        JobEntry entry;
+        JobEntry? entry;
 
         lock (syncRoot)
         {
-            if (!jobs.TryGetValue(jobId, out entry))
+            if (!jobs.TryGetValue(jobId, out entry) || entry is null)
             {
                 throw new KeyNotFoundException("指定したジョブは登録されていません。");
             }
@@ -244,17 +259,17 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     private sealed class DelegateJob : YatkJobBase
     {
-        private readonly Func<CancellationToken, Task> action;
+        private readonly Func<YatkJobContext, CancellationToken, Task> action;
 
-        public DelegateJob(Func<CancellationToken, Task> action, string? name)
+        public DelegateJob(Func<YatkJobContext, CancellationToken, Task> action, string? name)
             : base(name)
         {
             this.action = action;
         }
 
-        protected override Task ExecuteAsync(CancellationToken cancellationToken)
+        protected override Task ExecuteAsync(YatkJobContext context, CancellationToken cancellationToken)
         {
-            return action(cancellationToken);
+            return action(context, cancellationToken);
         }
     }
 
