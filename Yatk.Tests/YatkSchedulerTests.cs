@@ -167,6 +167,96 @@ public sealed class YatkSchedulerTests
         Assert.Equal(jobId, snapshot.JobId);
     }
 
+    [Fact]
+    public async Task Cancel_DoesNotExecuteQueuedJob()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondExecuted = false;
+        await using var scheduler = new YatkScheduler();
+
+        scheduler.Do(async _ =>
+        {
+            firstStarted.SetResult();
+            await releaseFirst.Task;
+        });
+        var jobId = scheduler.Do(_ =>
+        {
+            secondExecuted = true;
+            return Task.CompletedTask;
+        });
+
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(scheduler.Cancel(jobId));
+        Assert.Equal(YatkJobState.Canceled, scheduler.GetJob(jobId)?.State);
+
+        releaseFirst.SetResult();
+        await scheduler.DisposeAsync();
+
+        Assert.False(secondExecuted);
+        Assert.NotNull(scheduler.GetJob(jobId)?.CompletedAt);
+    }
+
+    [Fact]
+    public async Task Cancel_PropagatesTokenAndRecordsCanceled()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(async cancellationToken =>
+        {
+            started.SetResult();
+            using var registration = cancellationToken.Register(() => cancellationObserved.TrySetResult());
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(scheduler.Cancel(jobId));
+        await cancellationObserved.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await scheduler.DisposeAsync();
+
+        var snapshot = scheduler.GetJob(jobId);
+        Assert.NotNull(snapshot);
+        Assert.Equal(YatkJobState.Canceled, snapshot.State);
+        Assert.NotNull(snapshot.CompletedAt);
+    }
+
+    [Fact]
+    public async Task Cancel_IgnoredByJobResultsInSucceeded()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(async _ =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(scheduler.Cancel(jobId));
+        Assert.Equal(YatkJobState.CancelRequested, scheduler.GetJob(jobId)?.State);
+        Assert.False(scheduler.Cancel(jobId));
+        release.SetResult();
+        await scheduler.DisposeAsync();
+
+        Assert.Equal(YatkJobState.Succeeded, scheduler.GetJob(jobId)?.State);
+    }
+
+    [Fact]
+    public async Task Cancel_ReturnsFalseForCompletedOrUnknownJob()
+    {
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(_ => Task.CompletedTask);
+        await scheduler.DisposeAsync();
+
+        Assert.False(scheduler.Cancel(jobId));
+        Assert.False(scheduler.Cancel(new YatkJobId(Guid.NewGuid())));
+    }
+
     private sealed class TestJob : YatkJobBase
     {
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);

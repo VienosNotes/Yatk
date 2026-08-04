@@ -181,17 +181,19 @@ Implementation:
 - ラムダジョブ、YatkJobBase 派生ジョブ、FIFO キュー、固定最大並列度を実装した。
 - `YatkJobId`、`YatkJobState`、`YatkJobSnapshot` を追加し、`Queued`、`Running`、`Succeeded`、`Failed` の状態遷移と時刻・例外の記録を実装した。
 - `Enqueue` と `Do` が `YatkJobId` を返すようにし、`GetJob` と `GetJobs` で読み取り専用スナップショットを取得できるようにした。
+- `Cancel` を追加し、待機中ジョブのスキップと実行中ジョブへの協調キャンセルを実装した。
+- 実行中ジョブのキャンセルは `Running` から `CancelRequested` を経由し、該当ジョブのトークンによるキャンセル例外だけを `Canceled` として記録する。
 
 Tests:
-- ラムダジョブ、YatkJobBase 派生ジョブ、FIFO、最大並列度、例外後の継続、状態遷移、例外記録、スナップショット一覧を検証するテストを追加した。
-- `dotnet test Yatk.sln --no-restore` が成功した（8 件）。
+- ラムダジョブ、YatkJobBase 派生ジョブ、FIFO、最大並列度、例外後の継続、状態遷移、例外記録、スナップショット一覧、待機中・実行中ジョブのキャンセルを検証するテストを追加した。
+- `dotnet test Yatk.sln --no-restore` が成功した（12 件）。
 
 Deviations:
-- キャンセル、完了待機、動的並列度変更、イベント、Graceful Shutdown は今回の対象外とする。
+- 完了待機、動的並列度変更、イベント、Graceful Shutdown は今回の対象外とする。
 - 進捗と状態メッセージは `YatkJobContext` の実装時に追加する。
 
 Follow-ups:
-- 待機中・実行中ジョブのキャンセルと、`CancelRequested`・`Canceled` の状態遷移を追加する。
+- ジョブ完了の待機と、待機側だけを中断できる `CancellationToken` を追加する。
 ```
 
 以下の機能を実装してください。

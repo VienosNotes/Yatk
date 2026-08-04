@@ -69,12 +69,62 @@ public abstract class YatkJobBase
         }
     }
 
-    internal void MarkRunning(DateTimeOffset timestamp)
+    internal bool TryMarkRunning(DateTimeOffset timestamp)
     {
         lock (syncRoot)
         {
+            if (state != YatkJobState.Queued)
+            {
+                return false;
+            }
+
             state = YatkJobState.Running;
             startedAt = timestamp;
+            return true;
+        }
+    }
+
+    internal bool TryMarkCancelRequested()
+    {
+        lock (syncRoot)
+        {
+            if (state != YatkJobState.Running)
+            {
+                return false;
+            }
+
+            state = YatkJobState.CancelRequested;
+            return true;
+        }
+    }
+
+    internal bool TryMarkQueuedCanceled(DateTimeOffset timestamp)
+    {
+        lock (syncRoot)
+        {
+            if (state != YatkJobState.Queued)
+            {
+                return false;
+            }
+
+            state = YatkJobState.Canceled;
+            completedAt = timestamp;
+            return true;
+        }
+    }
+
+    internal bool TryMarkCanceledAfterCancellation(DateTimeOffset timestamp)
+    {
+        lock (syncRoot)
+        {
+            if (state != YatkJobState.CancelRequested)
+            {
+                return false;
+            }
+
+            state = YatkJobState.Canceled;
+            completedAt = timestamp;
+            return true;
         }
     }
 

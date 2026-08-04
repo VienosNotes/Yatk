@@ -8,8 +8,8 @@ namespace Yatk;
 public sealed class YatkScheduler : IAsyncDisposable
 {
     private readonly object syncRoot = new();
-    private readonly Channel<YatkJobBase> queue;
-    private readonly Dictionary<YatkJobId, YatkJobBase> jobs = new();
+    private readonly Channel<JobEntry> queue;
+    private readonly Dictionary<YatkJobId, JobEntry> jobs = new();
     private readonly Task[] workers;
     private bool isDisposed;
 
@@ -25,7 +25,7 @@ public sealed class YatkScheduler : IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
         }
 
-        queue = Channel.CreateUnbounded<YatkJobBase>(new UnboundedChannelOptions
+        queue = Channel.CreateUnbounded<JobEntry>(new UnboundedChannelOptions
         {
             SingleWriter = false,
             SingleReader = false,
@@ -75,8 +75,9 @@ public sealed class YatkScheduler : IAsyncDisposable
                 throw new InvalidOperationException("同じジョブを複数回投入することはできません。");
             }
 
-            jobs.Add(job.JobId, job);
-            if (!queue.Writer.TryWrite(job))
+            var entry = new JobEntry(job);
+            jobs.Add(job.JobId, entry);
+            if (!queue.Writer.TryWrite(entry))
             {
                 throw new InvalidOperationException("ジョブをキューへ投入できませんでした。");
             }
@@ -94,7 +95,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         lock (syncRoot)
         {
-            return jobs.TryGetValue(jobId, out var job) ? job.CreateSnapshot() : null;
+            return jobs.TryGetValue(jobId, out var entry) ? entry.Job.CreateSnapshot() : null;
         }
     }
 
@@ -106,8 +107,41 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         lock (syncRoot)
         {
-            return jobs.Values.Select(job => job.CreateSnapshot()).ToArray();
+            return jobs.Values.Select(entry => entry.Job.CreateSnapshot()).ToArray();
         }
+    }
+
+    /// <summary>
+    /// 指定したジョブのキャンセルを要求します。
+    /// </summary>
+    /// <param name="jobId">キャンセルするジョブの ID です。</param>
+    /// <returns>キャンセル要求を受理した場合は <see langword="true"/>。対象ジョブが存在しない、またはキャンセルできない状態の場合は <see langword="false"/> です。</returns>
+    public bool Cancel(YatkJobId jobId)
+    {
+        CancellationTokenSource? cancellationTokenSource = null;
+
+        lock (syncRoot)
+        {
+            if (!jobs.TryGetValue(jobId, out var entry))
+            {
+                return false;
+            }
+
+            if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
+            {
+                return true;
+            }
+
+            if (!entry.Job.TryMarkCancelRequested())
+            {
+                return false;
+            }
+
+            cancellationTokenSource = entry.CancellationTokenSource;
+        }
+
+        cancellationTokenSource.Cancel();
+        return true;
     }
 
     /// <summary>
@@ -128,24 +162,53 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
 
         await Task.WhenAll(workers).ConfigureAwait(false);
+
+        lock (syncRoot)
+        {
+            foreach (var entry in jobs.Values)
+            {
+                entry.CancellationTokenSource.Dispose();
+            }
+        }
     }
 
     private async Task ProcessQueueAsync()
     {
-        await foreach (var job in queue.Reader.ReadAllAsync().ConfigureAwait(false))
+        await foreach (var entry in queue.Reader.ReadAllAsync().ConfigureAwait(false))
         {
-            job.MarkRunning(DateTimeOffset.UtcNow);
+            if (!TryStart(entry))
+            {
+                continue;
+            }
 
             try
             {
-                await job.ExecuteInternalAsync(CancellationToken.None).ConfigureAwait(false);
-                job.MarkSucceeded(DateTimeOffset.UtcNow);
+                await entry.Job.ExecuteInternalAsync(entry.CancellationTokenSource.Token).ConfigureAwait(false);
+                entry.Job.MarkSucceeded(DateTimeOffset.UtcNow);
+            }
+            catch (OperationCanceledException exception) when (IsCancellationForJob(entry, exception))
+            {
+                entry.Job.TryMarkCanceledAfterCancellation(DateTimeOffset.UtcNow);
             }
             catch (Exception exception)
             {
-                job.MarkFailed(DateTimeOffset.UtcNow, exception);
+                entry.Job.MarkFailed(DateTimeOffset.UtcNow, exception);
             }
         }
+    }
+
+    private bool TryStart(JobEntry entry)
+    {
+        lock (syncRoot)
+        {
+            return entry.Job.TryMarkRunning(DateTimeOffset.UtcNow);
+        }
+    }
+
+    private static bool IsCancellationForJob(JobEntry entry, OperationCanceledException exception)
+    {
+        return entry.CancellationTokenSource.IsCancellationRequested
+            && exception.CancellationToken == entry.CancellationTokenSource.Token;
     }
 
     private void ThrowIfDisposed()
@@ -170,5 +233,18 @@ public sealed class YatkScheduler : IAsyncDisposable
         {
             return action(cancellationToken);
         }
+    }
+
+    private sealed class JobEntry
+    {
+        public JobEntry(YatkJobBase job)
+        {
+            Job = job;
+            CancellationTokenSource = new CancellationTokenSource();
+        }
+
+        public YatkJobBase Job { get; }
+
+        public CancellationTokenSource CancellationTokenSource { get; }
     }
 }
