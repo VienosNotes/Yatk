@@ -6,7 +6,7 @@ namespace Yatk;
 public sealed class YatkScheduler : IAsyncDisposable
 {
     private readonly object syncRoot = new();
-    private readonly Queue<JobEntry> queuedJobs = new();
+    private readonly LinkedList<JobEntry> queuedJobs = new();
     private readonly Dictionary<YatkJobId, JobEntry> jobs = new();
     private readonly Queue<YatkJobId> completedJobIds = new();
     private int maxConcurrency;
@@ -120,7 +120,7 @@ public sealed class YatkScheduler : IAsyncDisposable
 
             var entry = new JobEntry(job);
             jobs.Add(job.JobId, entry);
-            queuedJobs.Enqueue(entry);
+            entry.QueueNode = queuedJobs.AddLast(entry);
             snapshot = job.CreateSnapshot();
             StartAvailableJobs();
         }
@@ -173,6 +173,7 @@ public sealed class YatkScheduler : IAsyncDisposable
 
             if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
             {
+                RemoveQueuedJob(entry);
                 snapshot = entry.Job.CreateSnapshot();
                 RecordCompletion(entry);
             }
@@ -254,9 +255,11 @@ public sealed class YatkScheduler : IAsyncDisposable
                     snapshots = new List<YatkJobSnapshot>();
                     cancellationTokenSources = new List<CancellationTokenSource>();
 
-                    while (queuedJobs.Count > 0)
+                    while (queuedJobs.First is not null)
                     {
-                        var entry = queuedJobs.Dequeue();
+                        var entry = queuedJobs.First.Value;
+                        queuedJobs.RemoveFirst();
+                        entry.QueueNode = null;
                         if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
                         {
                             snapshots.Add(entry.Job.CreateSnapshot());
@@ -342,9 +345,11 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     private void StartAvailableJobs()
     {
-        while (runningCount < maxConcurrency && queuedJobs.Count > 0)
+        while (runningCount < maxConcurrency && queuedJobs.First is not null)
         {
-            var entry = queuedJobs.Dequeue();
+            var entry = queuedJobs.First.Value;
+            queuedJobs.RemoveFirst();
+            entry.QueueNode = null;
             if (!entry.Job.TryMarkRunning(DateTimeOffset.UtcNow))
             {
                 continue;
@@ -445,6 +450,15 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
     }
 
+    private void RemoveQueuedJob(JobEntry entry)
+    {
+        if (entry.QueueNode is not null)
+        {
+            queuedJobs.Remove(entry.QueueNode);
+            entry.QueueNode = null;
+        }
+    }
+
     private static bool IsCancellationForJob(JobEntry entry, OperationCanceledException exception)
     {
         return entry.CancellationTokenSource.IsCancellationRequested
@@ -529,5 +543,7 @@ public sealed class YatkScheduler : IAsyncDisposable
         public YatkJobBase Job { get; }
 
         public CancellationTokenSource CancellationTokenSource { get; }
+
+        public LinkedListNode<JobEntry>? QueueNode { get; set; }
     }
 }
