@@ -190,17 +190,17 @@ Implementation:
 - `StopAsync` を追加し、`Drain` と `Cancel` による停止を実装した。`DisposeAsync` は `Cancel` 相当で停止する。
 - `YatkSchedulerOptions`、`MaxConcurrency`、`SetMaxConcurrency` を追加し、実行中の最大並列度変更を実装した。増加時は待機中ジョブを追加で開始し、減少時は実行中ジョブを停止せず以後の開始を抑制する。
 - 実行管理は FIFO 待機キューと実行枠の管理に分離し、動的な並列度変更と停止処理を同じ同期範囲で扱うようにした。
+- `MaxRetainedCompletedJobs` を追加し、完了済みジョブを設定件数まで保持して最古のものから削除するようにした。`WaitForCompletionAsync` は、未登録または削除済みの ID に対して `false` を返す。
 
 Tests:
-- ラムダジョブ、YatkJobBase 派生ジョブ、FIFO、最大並列度、例外後の継続、状態遷移、例外記録、スナップショット一覧、待機中・実行中ジョブのキャンセル、完了待機、進捗・状態メッセージの報告、イベント、停止処理、動的並列度変更、同時投入を検証するテストを追加した。
-- `dotnet test Yatk.sln --no-restore` が成功した（30 件）。
+- ラムダジョブ、YatkJobBase 派生ジョブ、FIFO、最大並列度、例外後の継続、状態遷移、例外記録、スナップショット一覧、待機中・実行中ジョブのキャンセル、完了待機、進捗・状態メッセージの報告、イベント、停止処理、動的並列度変更、同時投入、完了済みジョブの保持上限を検証するテストを追加した。
+- `dotnet test Yatk.sln --no-restore` が成功した（33 件）。
 
 Deviations:
 - 正規の非同期デリゲートおよび派生ジョブの戻り値は、`ValueTask` ではなく `Task` とした。
 - `IYatkJob` は、公開投入対象を `YatkJobBase` に限定するため追加しない。
 
 Follow-ups:
-- 完了済みジョブの保持期間、最大保持件数、明示削除 API の方針を決定する。
 - `ValueTask` 形式の API を追加または `Task` 形式を初期版の正式 API として確定する。
 ```
 
@@ -416,10 +416,11 @@ Exception
 public sealed class YatkSchedulerOptions
 {
     public int MaxConcurrency { get; init; } = 1;
+    public int MaxRetainedCompletedJobs { get; init; } = 1000;
 }
 ```
 
-最大並列度は1以上とします。
+最大並列度は1以上とします。完了済みジョブの保持件数は0以上とし、0の場合は完了と同時にスケジューラから削除します。
 
 ### `YatkScheduler`
 
@@ -442,7 +443,7 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     public IReadOnlyList<YatkJobSnapshot> GetJobs();
 
-    public Task WaitForCompletionAsync(
+    public Task<bool> WaitForCompletionAsync(
         YatkJobId jobId,
         CancellationToken cancellationToken = default);
 
@@ -480,7 +481,10 @@ var snapshot = scheduler.GetJob(id);
 
 scheduler.Cancel(id);
 
-await scheduler.WaitForCompletionAsync(id);
+if (!await scheduler.WaitForCompletionAsync(id))
+{
+    // ジョブは未登録または保持期限切れです。
+}
 ```
 
 ## ラムダジョブ
@@ -576,7 +580,8 @@ JobIdを指定して、そのジョブが終了状態になるまで待機でき
 
 ジョブの成否は完了後のスナップショットで確認する方式としてください。
 
-存在しないJobIdを指定した場合の挙動は明確にし、専用例外または`KeyNotFoundException`のいずれかに統一してください。
+待機開始時に存在しない、または完了済みジョブの保持上限により削除済みのJobIdを指定した場合は、`false`を返してください。
+待機開始時にジョブが存在した場合は、その後に保持上限により削除されても、待機は通常どおり完了して`true`を返してください。
 
 待機側の`CancellationToken`は、ジョブそのものをキャンセルせず、完了待機だけを中断するものとします。
 
@@ -650,7 +655,9 @@ JobIdからジョブおよび内部実行情報を取得します。
 - スナップショット生成
 - ジョブ一覧取得
 
-完了済みジョブの自動削除は初期版では実装しなくて構いません。
+完了済みジョブは `YatkSchedulerOptions.MaxRetainedCompletedJobs` の件数まで完了順に保持してください。
+上限を超えた場合は、最も古く完了したジョブから登録一覧およびスケジューラが保持するジョブ参照を削除してください。
+削除済みジョブは `GetJob` から取得できず、`Cancel` は `false` を返し、`WaitForCompletionAsync` は `false` を返します。
 
 ### 待機キュー
 

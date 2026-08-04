@@ -414,14 +414,15 @@ public sealed class YatkSchedulerTests
         await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
     }
 
-    // 未登録ジョブを待機すると例外になることを確認する。
+    // 未登録ジョブを待機すると false が返ることを確認する。
     [Fact]
-    public async Task WaitForCompletionAsync_ThrowsForUnknownJob()
+    public async Task WaitForCompletionAsync_ReturnsFalseForUnknownJob()
     {
         await using var scheduler = new YatkScheduler();
 
-        await Assert.ThrowsAsync<KeyNotFoundException>(
-            () => scheduler.WaitForCompletionAsync(new YatkJobId(Guid.NewGuid())));
+        var result = await scheduler.WaitForCompletionAsync(new YatkJobId(Guid.NewGuid()));
+
+        Assert.False(result);
     }
 
     // 状態変更後のスナップショットをイベントで取得できることを確認する。
@@ -691,6 +692,63 @@ public sealed class YatkSchedulerTests
         release.SetResult();
         await scheduler.StopAsync(YatkShutdownMode.Drain).WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(jobCount, Volatile.Read(ref startedCount));
+    }
+
+    // 完了済みジョブが設定した保持件数を超えると最古のジョブから削除されることを確認する。
+    [Fact]
+    public async Task CompletedJobs_AreRemovedBeyondRetentionLimit()
+    {
+        await using var scheduler = new YatkScheduler(new YatkSchedulerOptions
+        {
+            MaxRetainedCompletedJobs = 1,
+        });
+
+        var firstJobId = scheduler.Do(_ => Task.CompletedTask);
+        Assert.True(await scheduler.WaitForCompletionAsync(firstJobId).WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.NotNull(scheduler.GetJob(firstJobId));
+
+        var secondJobId = scheduler.Do(_ => Task.CompletedTask);
+        Assert.True(await scheduler.WaitForCompletionAsync(secondJobId).WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.Null(scheduler.GetJob(firstJobId));
+        Assert.False(await scheduler.WaitForCompletionAsync(firstJobId));
+        Assert.NotNull(scheduler.GetJob(secondJobId));
+    }
+
+    // 削除前に待機を開始した場合は、完了後にジョブが削除されても true で完了することを確認する。
+    [Fact]
+    public async Task WaitForCompletionAsync_CompletesWhenJobIsRemovedAfterWaitStarts()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler(new YatkSchedulerOptions
+        {
+            MaxRetainedCompletedJobs = 0,
+        });
+
+        var jobId = scheduler.Do(async _ =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var waitTask = scheduler.WaitForCompletionAsync(jobId);
+        release.SetResult();
+
+        Assert.True(await waitTask.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Null(scheduler.GetJob(jobId));
+        Assert.False(await scheduler.WaitForCompletionAsync(jobId));
+    }
+
+    // 完了済みジョブの保持件数に負の値を指定できないことを確認する。
+    [Fact]
+    public void Constructor_RejectsNegativeCompletedJobRetentionLimit()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new YatkScheduler(new YatkSchedulerOptions
+        {
+            MaxRetainedCompletedJobs = -1,
+        }));
     }
 
     private sealed class TestJob : YatkJobBase

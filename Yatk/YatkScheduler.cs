@@ -8,7 +8,9 @@ public sealed class YatkScheduler : IAsyncDisposable
     private readonly object syncRoot = new();
     private readonly Queue<JobEntry> queuedJobs = new();
     private readonly Dictionary<YatkJobId, JobEntry> jobs = new();
+    private readonly Queue<YatkJobId> completedJobIds = new();
     private int maxConcurrency;
+    private readonly int maxRetainedCompletedJobs;
     private int runningCount;
     private Task? stopTask;
     private TaskCompletionSource? stopCompletion;
@@ -24,9 +26,8 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// <param name="maxConcurrency">同時に実行するジョブの最大数です。</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxConcurrency"/> が 1 未満の場合に発生します。</exception>
     public YatkScheduler(int maxConcurrency = 1)
+        : this(new YatkSchedulerOptions { MaxConcurrency = maxConcurrency })
     {
-        ValidateMaxConcurrency(maxConcurrency);
-        this.maxConcurrency = maxConcurrency;
     }
 
     /// <summary>
@@ -36,8 +37,13 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// <exception cref="ArgumentNullException"><paramref name="options"/> が <see langword="null"/> の場合に発生します。</exception>
     /// <exception cref="ArgumentOutOfRangeException"><see cref="YatkSchedulerOptions.MaxConcurrency"/> が 1 未満の場合に発生します。</exception>
     public YatkScheduler(YatkSchedulerOptions options)
-        : this((options ?? throw new ArgumentNullException(nameof(options))).MaxConcurrency)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        ValidateMaxConcurrency(options.MaxConcurrency);
+        ValidateMaxRetainedCompletedJobs(options.MaxRetainedCompletedJobs);
+
+        maxConcurrency = options.MaxConcurrency;
+        maxRetainedCompletedJobs = options.MaxRetainedCompletedJobs;
     }
 
     /// <summary>
@@ -53,6 +59,11 @@ public sealed class YatkScheduler : IAsyncDisposable
             }
         }
     }
+
+    /// <summary>
+    /// 保持する完了済みジョブの最大数を取得します。
+    /// </summary>
+    public int MaxRetainedCompletedJobs => maxRetainedCompletedJobs;
 
     /// <summary>
     /// ラムダ式のジョブをキューへ投入します。
@@ -163,6 +174,7 @@ public sealed class YatkScheduler : IAsyncDisposable
             if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
             {
                 snapshot = entry.Job.CreateSnapshot();
+                RecordCompletion(entry);
             }
             else if (entry.Job.TryMarkCancelRequested())
             {
@@ -185,10 +197,9 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// </summary>
     /// <param name="jobId">待機するジョブの ID です。</param>
     /// <param name="cancellationToken">待機のみを中断するためのトークンです。</param>
-    /// <returns>待機処理を表すタスクです。</returns>
-    /// <exception cref="KeyNotFoundException">指定したジョブが存在しない場合に発生します。</exception>
+    /// <returns>ジョブを見つけて完了まで待機できた場合は <see langword="true"/>。指定したジョブが未登録または保持期限切れの場合は <see langword="false"/> です。</returns>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> により待機が中断された場合に発生します。</exception>
-    public async Task WaitForCompletionAsync(YatkJobId jobId, CancellationToken cancellationToken = default)
+    public async Task<bool> WaitForCompletionAsync(YatkJobId jobId, CancellationToken cancellationToken = default)
     {
         JobEntry? entry;
 
@@ -196,11 +207,12 @@ public sealed class YatkScheduler : IAsyncDisposable
         {
             if (!jobs.TryGetValue(jobId, out entry) || entry is null)
             {
-                throw new KeyNotFoundException("指定したジョブは登録されていません。");
+                return false;
             }
         }
 
         await entry.Job.WaitForCompletionAsync(cancellationToken).ConfigureAwait(false);
+        return true;
     }
 
     /// <summary>
@@ -248,6 +260,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                         if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
                         {
                             snapshots.Add(entry.Job.CreateSnapshot());
+                            RecordCompletion(entry);
                         }
                     }
 
@@ -348,7 +361,9 @@ public sealed class YatkScheduler : IAsyncDisposable
         lock (syncRoot)
         {
             entry.Job.MarkSucceeded(DateTimeOffset.UtcNow);
-            return entry.Job.CreateSnapshot();
+            var snapshot = entry.Job.CreateSnapshot();
+            RecordCompletion(entry);
+            return snapshot;
         }
     }
 
@@ -361,7 +376,9 @@ public sealed class YatkScheduler : IAsyncDisposable
                 return null;
             }
 
-            return entry.Job.CreateSnapshot();
+            var snapshot = entry.Job.CreateSnapshot();
+            RecordCompletion(entry);
+            return snapshot;
         }
     }
 
@@ -370,7 +387,9 @@ public sealed class YatkScheduler : IAsyncDisposable
         lock (syncRoot)
         {
             entry.Job.MarkFailed(DateTimeOffset.UtcNow, exception);
-            return entry.Job.CreateSnapshot();
+            var snapshot = entry.Job.CreateSnapshot();
+            RecordCompletion(entry);
+            return snapshot;
         }
     }
 
@@ -409,6 +428,20 @@ public sealed class YatkScheduler : IAsyncDisposable
         if (stopCompletion is not null && queuedJobs.Count == 0 && runningCount == 0)
         {
             stopCompletion.TrySetResult();
+        }
+    }
+
+    private void RecordCompletion(JobEntry entry)
+    {
+        completedJobIds.Enqueue(entry.Job.JobId);
+
+        while (completedJobIds.Count > maxRetainedCompletedJobs)
+        {
+            var expiredJobId = completedJobIds.Dequeue();
+            if (jobs.Remove(expiredJobId, out var expiredEntry))
+            {
+                expiredEntry.CancellationTokenSource.Dispose();
+            }
         }
     }
 
@@ -458,6 +491,14 @@ public sealed class YatkScheduler : IAsyncDisposable
         if (maxConcurrency < 1)
         {
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
+        }
+    }
+
+    private static void ValidateMaxRetainedCompletedJobs(int maxRetainedCompletedJobs)
+    {
+        if (maxRetainedCompletedJobs < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxRetainedCompletedJobs));
         }
     }
 
