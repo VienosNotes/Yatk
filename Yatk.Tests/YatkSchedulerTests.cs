@@ -550,6 +550,149 @@ public sealed class YatkSchedulerTests
         await Task.WhenAll(firstStopTask, secondStopTask).WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    // オプションで初期最大並列度を指定できることを確認する。
+    [Fact]
+    public async Task Constructor_AppliesMaxConcurrencyFromOptions()
+    {
+        await using var scheduler = new YatkScheduler(new YatkSchedulerOptions { MaxConcurrency = 2 });
+
+        Assert.Equal(2, scheduler.MaxConcurrency);
+    }
+
+    // 最大並列度を増やすと待機中ジョブが追加で開始されることを確認する。
+    [Fact]
+    public async Task SetMaxConcurrency_IncreaseStartsQueuedJobs()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var startCount = 0;
+        await using var scheduler = new YatkScheduler(maxConcurrency: 1);
+
+        for (var index = 0; index < 3; index++)
+        {
+            scheduler.Do(async _ =>
+            {
+                var current = Interlocked.Increment(ref startCount);
+                if (current == 1)
+                {
+                    firstStarted.SetResult();
+                }
+
+                if (current == 3)
+                {
+                    started.SetResult();
+                }
+
+                await release.Task;
+            });
+        }
+
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, Volatile.Read(ref startCount));
+        scheduler.SetMaxConcurrency(3);
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        release.SetResult();
+    }
+
+    // 最大並列度を減らしても実行中ジョブを止めず、次の開始を抑制することを確認する。
+    [Fact]
+    public async Task SetMaxConcurrency_DecreaseDelaysNewJobs()
+    {
+        var allInitialJobsStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFinished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseOthers = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fourthStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var initialStartCount = 0;
+        await using var scheduler = new YatkScheduler(maxConcurrency: 3);
+
+        for (var index = 0; index < 3; index++)
+        {
+            var jobIndex = index;
+            scheduler.Do(async _ =>
+            {
+                if (Interlocked.Increment(ref initialStartCount) == 3)
+                {
+                    allInitialJobsStarted.SetResult();
+                }
+
+                if (jobIndex == 0)
+                {
+                    await releaseFirst.Task;
+                    firstFinished.SetResult();
+                }
+                else
+                {
+                    await releaseOthers.Task;
+                }
+            });
+        }
+
+        await allInitialJobsStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        scheduler.SetMaxConcurrency(1);
+        scheduler.Do(_ =>
+        {
+            fourthStarted.SetResult();
+            return Task.CompletedTask;
+        });
+
+        releaseFirst.SetResult();
+        await firstFinished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(fourthStarted.Task.IsCompleted);
+
+        releaseOthers.SetResult();
+        await fourthStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    // 無効な最大並列度がコンストラクタと変更 API の両方で拒否されることを確認する。
+    [Fact]
+    public async Task SetMaxConcurrency_RejectsValuesBelowOne()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new YatkScheduler(maxConcurrency: 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new YatkScheduler(new YatkSchedulerOptions { MaxConcurrency = 0 }));
+
+        await using var scheduler = new YatkScheduler();
+        Assert.Throws<ArgumentOutOfRangeException>(() => scheduler.SetMaxConcurrency(0));
+    }
+
+    // 複数スレッドから投入しても最大並列度を超えず全ジョブが実行されることを確認する。
+    [Fact]
+    public async Task Enqueue_IsThreadSafeUnderConcurrentCalls()
+    {
+        const int jobCount = 12;
+        const int maxConcurrency = 3;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var startedCount = 0;
+        var runningCount = 0;
+        var maximumObserved = 0;
+        await using var scheduler = new YatkScheduler(maxConcurrency);
+
+        var enqueueTasks = Enumerable.Range(0, jobCount).Select(_ => Task.Run(() =>
+            scheduler.Do(async _ =>
+            {
+                var current = Interlocked.Increment(ref runningCount);
+                UpdateMaximum(ref maximumObserved, current);
+                if (Interlocked.Increment(ref startedCount) == maxConcurrency)
+                {
+                    allStarted.SetResult();
+                }
+
+                await release.Task;
+                Interlocked.Decrement(ref runningCount);
+            })));
+
+        await Task.WhenAll(enqueueTasks);
+        await allStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(maxConcurrency, maximumObserved);
+
+        release.SetResult();
+        await scheduler.StopAsync(YatkShutdownMode.Drain).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(jobCount, Volatile.Read(ref startedCount));
+    }
+
     private sealed class TestJob : YatkJobBase
     {
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);

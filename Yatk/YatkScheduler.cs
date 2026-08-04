@@ -1,17 +1,17 @@
-using System.Threading.Channels;
-
 namespace Yatk;
 
 /// <summary>
-/// FIFO キュー上でジョブを固定数まで並列実行するスケジューラです。
+/// FIFO キュー上でジョブを指定した最大数まで並列実行するスケジューラです。
 /// </summary>
 public sealed class YatkScheduler : IAsyncDisposable
 {
     private readonly object syncRoot = new();
-    private readonly Channel<JobEntry> queue;
+    private readonly Queue<JobEntry> queuedJobs = new();
     private readonly Dictionary<YatkJobId, JobEntry> jobs = new();
-    private readonly Task[] workers;
+    private int maxConcurrency;
+    private int runningCount;
     private Task? stopTask;
+    private TaskCompletionSource? stopCompletion;
 
     /// <summary>
     /// ジョブの状態が変更されたときに発生します。
@@ -25,21 +25,32 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxConcurrency"/> が 1 未満の場合に発生します。</exception>
     public YatkScheduler(int maxConcurrency = 1)
     {
-        if (maxConcurrency < 1)
-        {
-            throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
-        }
+        ValidateMaxConcurrency(maxConcurrency);
+        this.maxConcurrency = maxConcurrency;
+    }
 
-        queue = Channel.CreateUnbounded<JobEntry>(new UnboundedChannelOptions
-        {
-            SingleWriter = false,
-            SingleReader = false,
-        });
-        workers = new Task[maxConcurrency];
+    /// <summary>
+    /// 指定した設定でスケジューラを初期化します。
+    /// </summary>
+    /// <param name="options">初期設定です。</param>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> が <see langword="null"/> の場合に発生します。</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><see cref="YatkSchedulerOptions.MaxConcurrency"/> が 1 未満の場合に発生します。</exception>
+    public YatkScheduler(YatkSchedulerOptions options)
+        : this((options ?? throw new ArgumentNullException(nameof(options))).MaxConcurrency)
+    {
+    }
 
-        for (var index = 0; index < workers.Length; index++)
+    /// <summary>
+    /// 現在の最大並列度を取得します。
+    /// </summary>
+    public int MaxConcurrency
+    {
+        get
         {
-            workers[index] = ProcessQueueAsync();
+            lock (syncRoot)
+            {
+                return maxConcurrency;
+            }
         }
     }
 
@@ -98,12 +109,9 @@ public sealed class YatkScheduler : IAsyncDisposable
 
             var entry = new JobEntry(job);
             jobs.Add(job.JobId, entry);
-            if (!queue.Writer.TryWrite(entry))
-            {
-                throw new InvalidOperationException("ジョブをキューへ投入できませんでした。");
-            }
-
+            queuedJobs.Enqueue(entry);
             snapshot = job.CreateSnapshot();
+            StartAvailableJobs();
         }
 
         RaiseJobChanged(snapshot);
@@ -196,6 +204,22 @@ public sealed class YatkScheduler : IAsyncDisposable
     }
 
     /// <summary>
+    /// 最大並列度を変更します。
+    /// </summary>
+    /// <param name="maxConcurrency">変更後の最大並列度です。</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxConcurrency"/> が 1 未満の場合に発生します。</exception>
+    public void SetMaxConcurrency(int maxConcurrency)
+    {
+        ValidateMaxConcurrency(maxConcurrency);
+
+        lock (syncRoot)
+        {
+            this.maxConcurrency = maxConcurrency;
+            StartAvailableJobs();
+        }
+    }
+
+    /// <summary>
     /// 新規投入を停止し、指定した方法で登録済みジョブを終了させます。
     /// </summary>
     /// <param name="mode">停止方法です。</param>
@@ -211,27 +235,37 @@ public sealed class YatkScheduler : IAsyncDisposable
         {
             if (stopTask is null)
             {
-                queue.Writer.TryComplete();
+                stopCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
                 if (mode == YatkShutdownMode.Cancel)
                 {
                     snapshots = new List<YatkJobSnapshot>();
                     cancellationTokenSources = new List<CancellationTokenSource>();
 
-                    foreach (var entry in jobs.Values)
+                    while (queuedJobs.Count > 0)
                     {
+                        var entry = queuedJobs.Dequeue();
                         if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
                         {
                             snapshots.Add(entry.Job.CreateSnapshot());
                         }
-                        else if (entry.Job.TryMarkCancelRequested())
+                    }
+
+                    foreach (var entry in jobs.Values)
+                    {
+                        if (entry.Job.TryMarkCancelRequested())
                         {
                             snapshots.Add(entry.Job.CreateSnapshot());
                             cancellationTokenSources.Add(entry.CancellationTokenSource);
                         }
                     }
                 }
+                else
+                {
+                    StartAvailableJobs();
+                }
 
+                TryCompleteStop();
                 stopTask = StopCoreAsync();
             }
 
@@ -266,48 +300,46 @@ public sealed class YatkScheduler : IAsyncDisposable
         await StopAsync(YatkShutdownMode.Cancel).ConfigureAwait(false);
     }
 
-    private async Task ProcessQueueAsync()
+    private async Task ProcessJobAsync(JobEntry entry, YatkJobSnapshot runningSnapshot)
     {
-        await foreach (var entry in queue.Reader.ReadAllAsync().ConfigureAwait(false))
+        RaiseJobChanged(runningSnapshot);
+
+        try
         {
-            var runningSnapshot = TryStart(entry);
-            if (runningSnapshot is null)
+            await entry.Job.ExecuteInternalAsync(entry.CancellationTokenSource.Token).ConfigureAwait(false);
+            RaiseJobChanged(MarkSucceeded(entry));
+        }
+        catch (OperationCanceledException exception) when (IsCancellationForJob(entry, exception))
+        {
+            var canceledSnapshot = TryMarkCanceledAfterCancellation(entry);
+            if (canceledSnapshot is not null)
+            {
+                RaiseJobChanged(canceledSnapshot);
+            }
+        }
+        catch (Exception exception)
+        {
+            RaiseJobChanged(MarkFailed(entry, exception));
+        }
+        finally
+        {
+            OnJobExecutionFinished();
+        }
+    }
+
+    private void StartAvailableJobs()
+    {
+        while (runningCount < maxConcurrency && queuedJobs.Count > 0)
+        {
+            var entry = queuedJobs.Dequeue();
+            if (!entry.Job.TryMarkRunning(DateTimeOffset.UtcNow))
             {
                 continue;
             }
 
-            RaiseJobChanged(runningSnapshot);
-
-            try
-            {
-                await entry.Job.ExecuteInternalAsync(entry.CancellationTokenSource.Token).ConfigureAwait(false);
-                RaiseJobChanged(MarkSucceeded(entry));
-            }
-            catch (OperationCanceledException exception) when (IsCancellationForJob(entry, exception))
-            {
-                var canceledSnapshot = TryMarkCanceledAfterCancellation(entry);
-                if (canceledSnapshot is not null)
-                {
-                    RaiseJobChanged(canceledSnapshot);
-                }
-            }
-            catch (Exception exception)
-            {
-                RaiseJobChanged(MarkFailed(entry, exception));
-            }
-        }
-    }
-
-    private YatkJobSnapshot? TryStart(JobEntry entry)
-    {
-        lock (syncRoot)
-        {
-            if (!entry.Job.TryMarkRunning(DateTimeOffset.UtcNow))
-            {
-                return null;
-            }
-
-            return entry.Job.CreateSnapshot();
+            var runningSnapshot = entry.Job.CreateSnapshot();
+            runningCount++;
+            _ = Task.Run(() => ProcessJobAsync(entry, runningSnapshot));
         }
     }
 
@@ -342,9 +374,26 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
     }
 
+    private void OnJobExecutionFinished()
+    {
+        lock (syncRoot)
+        {
+            runningCount--;
+            StartAvailableJobs();
+            TryCompleteStop();
+        }
+    }
+
     private async Task StopCoreAsync()
     {
-        await Task.WhenAll(workers).ConfigureAwait(false);
+        Task completion;
+
+        lock (syncRoot)
+        {
+            completion = stopCompletion!.Task;
+        }
+
+        await completion.ConfigureAwait(false);
 
         lock (syncRoot)
         {
@@ -352,6 +401,14 @@ public sealed class YatkScheduler : IAsyncDisposable
             {
                 entry.CancellationTokenSource.Dispose();
             }
+        }
+    }
+
+    private void TryCompleteStop()
+    {
+        if (stopCompletion is not null && queuedJobs.Count == 0 && runningCount == 0)
+        {
+            stopCompletion.TrySetResult();
         }
     }
 
@@ -393,6 +450,14 @@ public sealed class YatkScheduler : IAsyncDisposable
         if (stopTask is not null)
         {
             throw new ObjectDisposedException(nameof(YatkScheduler));
+        }
+    }
+
+    private static void ValidateMaxConcurrency(int maxConcurrency)
+    {
+        if (maxConcurrency < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxConcurrency));
         }
     }
 
