@@ -151,7 +151,7 @@ public sealed class YatkSchedulerTests
         await using var scheduler = new YatkScheduler();
 
         var jobId = scheduler.Do(_ => throw new InvalidOperationException("失敗"));
-        await scheduler.DisposeAsync();
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
 
         var snapshot = scheduler.GetJob(jobId);
         Assert.NotNull(snapshot);
@@ -422,6 +422,132 @@ public sealed class YatkSchedulerTests
 
         await Assert.ThrowsAsync<KeyNotFoundException>(
             () => scheduler.WaitForCompletionAsync(new YatkJobId(Guid.NewGuid())));
+    }
+
+    // 状態変更後のスナップショットをイベントで取得できることを確認する。
+    [Fact]
+    public async Task JobChanged_RaisesForLifecycleChanges()
+    {
+        var states = new ConcurrentQueue<YatkJobState>();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+        scheduler.JobChanged += (_, eventArgs) => states.Enqueue(eventArgs.Snapshot.State);
+
+        var jobId = scheduler.Do(async _ =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        release.SetResult();
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Contains(YatkJobState.Queued, states);
+        Assert.Contains(YatkJobState.Running, states);
+        Assert.Contains(YatkJobState.Succeeded, states);
+    }
+
+    // イベントハンドラの例外でジョブ実行が停止しないことを確認する。
+    [Fact]
+    public async Task JobChanged_HandlerExceptionDoesNotStopScheduler()
+    {
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+        scheduler.JobChanged += (_, _) => throw new InvalidOperationException("イベント失敗");
+
+        var jobId = scheduler.Do(_ =>
+        {
+            completed.SetResult();
+            return Task.CompletedTask;
+        });
+
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(YatkJobState.Succeeded, scheduler.GetJob(jobId)?.State);
+    }
+
+    // Drain 停止で待機中ジョブを含む全ジョブが完了することを確認する。
+    [Fact]
+    public async Task StopAsync_DrainCompletesQueuedJobs()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+
+        var firstJobId = scheduler.Do(async _ =>
+        {
+            firstStarted.SetResult();
+            await releaseFirst.Task;
+        });
+        var secondJobId = scheduler.Do(_ =>
+        {
+            secondCompleted.SetResult();
+            return Task.CompletedTask;
+        });
+
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var stopTask = scheduler.StopAsync(YatkShutdownMode.Drain);
+        Assert.Throws<ObjectDisposedException>(() => scheduler.Do(_ => Task.CompletedTask));
+
+        releaseFirst.SetResult();
+        await stopTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await secondCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(YatkJobState.Succeeded, scheduler.GetJob(firstJobId)?.State);
+        Assert.Equal(YatkJobState.Succeeded, scheduler.GetJob(secondJobId)?.State);
+    }
+
+    // Cancel 停止で待機中・実行中ジョブがキャンセルされることを確認する。
+    [Fact]
+    public async Task StopAsync_CancelCancelsQueuedAndRunningJobs()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondExecuted = false;
+        await using var scheduler = new YatkScheduler();
+
+        var firstJobId = scheduler.Do(async cancellationToken =>
+        {
+            firstStarted.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        });
+        var secondJobId = scheduler.Do(_ =>
+        {
+            secondExecuted = true;
+            return Task.CompletedTask;
+        });
+
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await scheduler.StopAsync(YatkShutdownMode.Cancel).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(YatkJobState.Canceled, scheduler.GetJob(firstJobId)?.State);
+        Assert.Equal(YatkJobState.Canceled, scheduler.GetJob(secondJobId)?.State);
+        Assert.False(secondExecuted);
+    }
+
+    // 複数回の停止要求が同じ停止処理の完了を待機できることを確認する。
+    [Fact]
+    public async Task StopAsync_CanBeCalledMultipleTimes()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+
+        scheduler.Do(async _ =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var firstStopTask = scheduler.StopAsync(YatkShutdownMode.Drain);
+        var secondStopTask = scheduler.StopAsync(YatkShutdownMode.Cancel);
+
+        release.SetResult();
+        await Task.WhenAll(firstStopTask, secondStopTask).WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     private sealed class TestJob : YatkJobBase
