@@ -189,7 +189,11 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
 
         RaiseJobChanged(snapshot);
-        cancellationTokenSource?.Cancel();
+        if (cancellationTokenSource is not null)
+        {
+            RequestCancellation(cancellationTokenSource);
+        }
+
         return true;
     }
 
@@ -300,7 +304,7 @@ public sealed class YatkScheduler : IAsyncDisposable
         {
             foreach (var cancellationTokenSource in cancellationTokenSources)
             {
-                cancellationTokenSource.Cancel();
+                RequestCancellation(cancellationTokenSource);
             }
         }
 
@@ -463,6 +467,18 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         return entry.CancellationTokenSource.IsCancellationRequested
             && exception.CancellationToken == entry.CancellationTokenSource.Token;
+    }
+
+    private static void RequestCancellation(CancellationTokenSource cancellationTokenSource)
+    {
+        try
+        {
+            cancellationTokenSource.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 完了処理との競合で既に破棄されている場合は、キャンセル通知が不要になっている。
+        }
     }
 
     private void RaiseJobChanged(YatkJobSnapshot? snapshot)

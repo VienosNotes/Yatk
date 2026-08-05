@@ -751,6 +751,49 @@ public sealed class YatkSchedulerTests
         }));
     }
 
+    // キャンセル要求と完了済みジョブの削除が競合してもキャンセルが例外を送出しないことを確認する。
+    [Fact]
+    public async Task Cancel_DoesNotThrowWhenCompletionRemovesJobDuringCancellation()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var terminalStateChanged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler(new YatkSchedulerOptions
+        {
+            MaxRetainedCompletedJobs = 0,
+        });
+
+        var jobId = scheduler.Do(async _ =>
+        {
+            started.SetResult();
+            await release.Task;
+        });
+        scheduler.JobChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.JobId != jobId)
+            {
+                return;
+            }
+
+            if (eventArgs.Snapshot.State == YatkJobState.CancelRequested)
+            {
+                release.SetResult();
+                if (!terminalStateChanged.Task.Wait(TimeSpan.FromSeconds(5)))
+                {
+                    throw new TimeoutException("ジョブが完了しませんでした。");
+                }
+            }
+            else if (eventArgs.Snapshot.State == YatkJobState.Succeeded)
+            {
+                terminalStateChanged.SetResult();
+            }
+        };
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(scheduler.Cancel(jobId));
+    }
+
     private sealed class TestJob : YatkJobBase
     {
         public TaskCompletionSource Completed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
