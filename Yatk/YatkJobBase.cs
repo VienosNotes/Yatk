@@ -183,9 +183,18 @@ public abstract class YatkJobBase
         }
     }
 
-    internal Task ExecuteInternalAsync(CancellationToken cancellationToken)
+    internal async Task ExecuteInternalAsync(CancellationToken cancellationToken)
     {
-        return ExecuteAsync(new YatkJobContext(this), cancellationToken);
+        var context = new YatkJobContext(this);
+
+        try
+        {
+            await ExecuteAsync(context, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            context.Invalidate();
+        }
     }
 
     internal void SetProgress(double value)

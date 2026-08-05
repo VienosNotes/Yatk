@@ -425,9 +425,9 @@ public sealed class YatkSchedulerTests
         Assert.False(result);
     }
 
-    // 状態変更後のスナップショットをイベントで取得できることを確認する。
+    // 1 件のジョブについて、状態変更イベントがライフサイクルの順序で配送されることを確認する。
     [Fact]
-    public async Task JobChanged_RaisesForLifecycleChanges()
+    public async Task JobChanged_DeliversLifecycleChangesInOrder()
     {
         var states = new ConcurrentQueue<YatkJobState>();
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -445,9 +445,9 @@ public sealed class YatkSchedulerTests
         release.SetResult();
         await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
 
-        Assert.Contains(YatkJobState.Queued, states);
-        Assert.Contains(YatkJobState.Running, states);
-        Assert.Contains(YatkJobState.Succeeded, states);
+        Assert.Equal(
+            [YatkJobState.Queued, YatkJobState.Running, YatkJobState.Succeeded],
+            states.ToArray());
     }
 
     // イベントハンドラの例外でジョブ実行が停止しないことを確認する。
@@ -792,6 +792,80 @@ public sealed class YatkSchedulerTests
         await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(scheduler.Cancel(jobId));
+    }
+
+    // 完了後に保持されたコンテキストから状態を更新してもスナップショットが変化しないことを確認する。
+    [Fact]
+    public async Task JobContext_DoesNotUpdateSnapshotAfterCompletion()
+    {
+        YatkJobContext? capturedContext = null;
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do((context, _) =>
+        {
+            capturedContext = context;
+            return Task.CompletedTask;
+        });
+
+        Assert.True(await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5)));
+        capturedContext!.ReportProgress(0.5);
+        capturedContext.SetStatusMessage("完了後");
+
+        var snapshot = scheduler.GetJob(jobId);
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot.Progress);
+        Assert.Null(snapshot.StatusMessage);
+    }
+
+    // キャンセル要求のイベントハンドラがブロックしてもキャンセルトークンが先に通知されることを確認する。
+    [Fact]
+    public async Task Cancel_PropagatesTokenBeforeInvokingCancelRequestedHandler()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancellationObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handlerEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(async cancellationToken =>
+        {
+            using var registration = cancellationToken.Register(() => cancellationObserved.SetResult());
+            started.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        });
+        scheduler.JobChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.JobId == jobId && eventArgs.Snapshot.State == YatkJobState.CancelRequested)
+            {
+                handlerEntered.SetResult();
+                releaseHandler.Task.GetAwaiter().GetResult();
+            }
+        };
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var cancelTask = Task.Run(() => scheduler.Cancel(jobId));
+        await handlerEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            Assert.True(cancellationObserved.Task.IsCompleted);
+        }
+        finally
+        {
+            releaseHandler.SetResult();
+        }
+
+        Assert.True(await cancelTask.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    // 未定義の停止モードを指定すると例外になることを確認する。
+    [Fact]
+    public async Task StopAsync_RejectsUndefinedShutdownMode()
+    {
+        await using var scheduler = new YatkScheduler();
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => scheduler.StopAsync((YatkShutdownMode)999));
     }
 
     private sealed class TestJob : YatkJobBase

@@ -9,9 +9,11 @@ public sealed class YatkScheduler : IAsyncDisposable
     private readonly LinkedList<JobEntry> queuedJobs = new();
     private readonly Dictionary<YatkJobId, JobEntry> jobs = new();
     private readonly Queue<YatkJobId> completedJobIds = new();
+    private readonly Queue<YatkJobSnapshot> pendingJobChanges = new();
     private int maxConcurrency;
     private readonly int maxRetainedCompletedJobs;
     private int runningCount;
+    private bool isDispatchingJobChanges;
     private Task? stopTask;
     private TaskCompletionSource? stopCompletion;
 
@@ -122,10 +124,11 @@ public sealed class YatkScheduler : IAsyncDisposable
             jobs.Add(job.JobId, entry);
             entry.QueueNode = queuedJobs.AddLast(entry);
             snapshot = job.CreateSnapshot();
+            EnqueueJobChanged(snapshot);
             StartAvailableJobs();
         }
 
-        RaiseJobChanged(snapshot);
+        DispatchJobChanges();
         return job.JobId;
     }
 
@@ -186,14 +189,16 @@ public sealed class YatkScheduler : IAsyncDisposable
             {
                 return false;
             }
+
+            EnqueueJobChanged(snapshot);
         }
 
-        RaiseJobChanged(snapshot);
         if (cancellationTokenSource is not null)
         {
             RequestCancellation(cancellationTokenSource);
         }
 
+        DispatchJobChanges();
         return true;
     }
 
@@ -234,6 +239,8 @@ public sealed class YatkScheduler : IAsyncDisposable
             this.maxConcurrency = maxConcurrency;
             StartAvailableJobs();
         }
+
+        DispatchJobChanges();
     }
 
     /// <summary>
@@ -244,7 +251,11 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// <returns>停止処理を表すタスクです。</returns>
     public Task StopAsync(YatkShutdownMode mode, CancellationToken cancellationToken = default)
     {
-        List<YatkJobSnapshot>? snapshots = null;
+        if (!Enum.IsDefined(mode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(mode));
+        }
+
         List<CancellationTokenSource>? cancellationTokenSources = null;
         Task currentStopTask;
 
@@ -256,7 +267,6 @@ public sealed class YatkScheduler : IAsyncDisposable
 
                 if (mode == YatkShutdownMode.Cancel)
                 {
-                    snapshots = new List<YatkJobSnapshot>();
                     cancellationTokenSources = new List<CancellationTokenSource>();
 
                     while (queuedJobs.First is not null)
@@ -266,7 +276,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                         entry.QueueNode = null;
                         if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
                         {
-                            snapshots.Add(entry.Job.CreateSnapshot());
+                            EnqueueJobChanged(entry.Job.CreateSnapshot());
                             RecordCompletion(entry);
                         }
                     }
@@ -275,7 +285,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                     {
                         if (entry.Job.TryMarkCancelRequested())
                         {
-                            snapshots.Add(entry.Job.CreateSnapshot());
+                            EnqueueJobChanged(entry.Job.CreateSnapshot());
                             cancellationTokenSources.Add(entry.CancellationTokenSource);
                         }
                     }
@@ -292,14 +302,6 @@ public sealed class YatkScheduler : IAsyncDisposable
             currentStopTask = stopTask;
         }
 
-        if (snapshots is not null)
-        {
-            foreach (var snapshot in snapshots)
-            {
-                RaiseJobChanged(snapshot);
-            }
-        }
-
         if (cancellationTokenSources is not null)
         {
             foreach (var cancellationTokenSource in cancellationTokenSources)
@@ -307,6 +309,8 @@ public sealed class YatkScheduler : IAsyncDisposable
                 RequestCancellation(cancellationTokenSource);
             }
         }
+
+        DispatchJobChanges();
 
         return currentStopTask.WaitAsync(cancellationToken);
     }
@@ -320,26 +324,23 @@ public sealed class YatkScheduler : IAsyncDisposable
         await StopAsync(YatkShutdownMode.Cancel).ConfigureAwait(false);
     }
 
-    private async Task ProcessJobAsync(JobEntry entry, YatkJobSnapshot runningSnapshot)
+    private async Task ProcessJobAsync(JobEntry entry)
     {
-        RaiseJobChanged(runningSnapshot);
-
         try
         {
             await entry.Job.ExecuteInternalAsync(entry.CancellationTokenSource.Token).ConfigureAwait(false);
-            RaiseJobChanged(MarkSucceeded(entry));
+            MarkSucceeded(entry);
+            DispatchJobChanges();
         }
         catch (OperationCanceledException exception) when (IsCancellationForJob(entry, exception))
         {
-            var canceledSnapshot = TryMarkCanceledAfterCancellation(entry);
-            if (canceledSnapshot is not null)
-            {
-                RaiseJobChanged(canceledSnapshot);
-            }
+            TryMarkCanceledAfterCancellation(entry);
+            DispatchJobChanges();
         }
         catch (Exception exception)
         {
-            RaiseJobChanged(MarkFailed(entry, exception));
+            MarkFailed(entry, exception);
+            DispatchJobChanges();
         }
         finally
         {
@@ -360,45 +361,46 @@ public sealed class YatkScheduler : IAsyncDisposable
             }
 
             var runningSnapshot = entry.Job.CreateSnapshot();
+            EnqueueJobChanged(runningSnapshot);
             runningCount++;
-            _ = Task.Run(() => ProcessJobAsync(entry, runningSnapshot));
+            _ = Task.Run(() => ProcessJobAsync(entry));
         }
     }
 
-    private YatkJobSnapshot MarkSucceeded(JobEntry entry)
+    private void MarkSucceeded(JobEntry entry)
     {
         lock (syncRoot)
         {
             entry.Job.MarkSucceeded(DateTimeOffset.UtcNow);
             var snapshot = entry.Job.CreateSnapshot();
             RecordCompletion(entry);
-            return snapshot;
+            EnqueueJobChanged(snapshot);
         }
     }
 
-    private YatkJobSnapshot? TryMarkCanceledAfterCancellation(JobEntry entry)
+    private void TryMarkCanceledAfterCancellation(JobEntry entry)
     {
         lock (syncRoot)
         {
             if (!entry.Job.TryMarkCanceledAfterCancellation(DateTimeOffset.UtcNow))
             {
-                return null;
+                return;
             }
 
             var snapshot = entry.Job.CreateSnapshot();
             RecordCompletion(entry);
-            return snapshot;
+            EnqueueJobChanged(snapshot);
         }
     }
 
-    private YatkJobSnapshot MarkFailed(JobEntry entry, Exception exception)
+    private void MarkFailed(JobEntry entry, Exception exception)
     {
         lock (syncRoot)
         {
             entry.Job.MarkFailed(DateTimeOffset.UtcNow, exception);
             var snapshot = entry.Job.CreateSnapshot();
             RecordCompletion(entry);
-            return snapshot;
+            EnqueueJobChanged(snapshot);
         }
     }
 
@@ -410,6 +412,8 @@ public sealed class YatkScheduler : IAsyncDisposable
             StartAvailableJobs();
             TryCompleteStop();
         }
+
+        DispatchJobChanges();
     }
 
     private async Task StopCoreAsync()
@@ -481,13 +485,63 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
     }
 
-    private void RaiseJobChanged(YatkJobSnapshot? snapshot)
+    /// <summary>
+    /// 状態遷移と同じ同期範囲で、変更通知を配送待ちキューへ追加します。
+    /// </summary>
+    /// <remarks>
+    /// 状態を変更したスレッドが直ちにイベントハンドラを呼ぶと、別スレッドで先に発生した通知との順序が逆転し得ます。
+    /// このメソッドで通知をキューへ記録し、<see cref="DispatchJobChanges"/> が FIFO 順に配送することで、状態遷移の順序を保ちます。
+    /// 呼び出し元は <see cref="syncRoot"/> を保持している必要があります。
+    /// </remarks>
+    private void EnqueueJobChanged(YatkJobSnapshot snapshot)
     {
-        if (snapshot is null)
+        pendingJobChanges.Enqueue(snapshot);
+    }
+
+    /// <summary>
+    /// 配送待ちの状態変更通知を、イベントハンドラへ FIFO 順に配送します。
+    /// </summary>
+    /// <remarks>
+    /// 一度に一つの呼び出しだけが配送役になります。配送中に別スレッドで新しい通知が追加された場合、
+    /// その呼び出しは何もせず、配送役が同じキューから続けて通知します。
+    /// イベントハンドラは <see cref="syncRoot"/> の外で実行するため、ハンドラからスケジューラ API を呼び出してもデッドロックしません。
+    /// </remarks>
+    private void DispatchJobChanges()
+    {
+        lock (syncRoot)
         {
-            return;
+            if (isDispatchingJobChanges)
+            {
+                return;
+            }
+
+            isDispatchingJobChanges = true;
         }
 
+        while (true)
+        {
+            YatkJobSnapshot? snapshot;
+
+            lock (syncRoot)
+            {
+                if (pendingJobChanges.Count == 0)
+                {
+                    isDispatchingJobChanges = false;
+                    return;
+                }
+
+                snapshot = pendingJobChanges.Dequeue();
+            }
+
+            InvokeJobChanged(snapshot);
+        }
+    }
+
+    /// <summary>
+    /// 一つのスナップショットに対するイベントハンドラを、例外を隔離して実行します。
+    /// </summary>
+    private void InvokeJobChanged(YatkJobSnapshot snapshot)
+    {
         var handlers = JobChanged;
         if (handlers is null)
         {
