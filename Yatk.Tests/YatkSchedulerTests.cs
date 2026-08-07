@@ -869,6 +869,215 @@ public sealed class YatkSchedulerTests
         }
     }
 
+    // High ジョブが Normal ジョブより先に、High 同士では FIFO 順に実行されることを確認する。
+    [Fact]
+    public async Task HighPriorityJobs_RunBeforeNormalJobsInFifoOrder()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executionOrder = new List<string>();
+        await using var scheduler = new YatkScheduler(maxConcurrency: 1);
+
+        scheduler.Do(async _ =>
+        {
+            firstStarted.SetResult();
+            await releaseFirst.Task;
+        });
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        scheduler.Do(_ =>
+        {
+            executionOrder.Add("normal");
+            return Task.CompletedTask;
+        });
+        scheduler.Do(_ =>
+        {
+            executionOrder.Add("high-1");
+            return Task.CompletedTask;
+        }, priority: YatkJobPriority.High);
+        scheduler.Do(_ =>
+        {
+            executionOrder.Add("high-2");
+            return Task.CompletedTask;
+        }, priority: YatkJobPriority.High);
+
+        releaseFirst.SetResult();
+        await scheduler.StopAsync(YatkShutdownMode.Drain).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(["high-1", "high-2", "normal"], executionOrder);
+    }
+
+    // Immediate ジョブが最大並列度を超えて開始し、超過解消まで待機ジョブを開始しないことを確認する。
+    [Fact]
+    public async Task ImmediateJob_StartsBeyondLimitAndKeepsQueuedJobWaitingUntilBelowLimit()
+    {
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var immediateStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseImmediate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler(maxConcurrency: 1);
+
+        scheduler.Do(async _ =>
+        {
+            firstStarted.SetResult();
+            await releaseFirst.Task;
+        });
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        scheduler.Do(_ =>
+        {
+            secondStarted.SetResult();
+            return Task.CompletedTask;
+        });
+        var immediateJobId = scheduler.Do(async _ =>
+        {
+            immediateStarted.SetResult();
+            await releaseImmediate.Task;
+        }, priority: YatkJobPriority.Immediate);
+
+        try
+        {
+            Assert.Equal(YatkJobState.Running, scheduler.GetJob(immediateJobId)?.State);
+            await immediateStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1, scheduler.MaxConcurrency);
+
+            releaseImmediate.SetResult();
+            Assert.True(await scheduler.WaitForCompletionAsync(immediateJobId).WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.False(secondStarted.Task.IsCompleted);
+        }
+        finally
+        {
+            releaseImmediate.TrySetResult();
+            releaseFirst.TrySetResult();
+        }
+
+        await secondStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    // 指定した優先度がスナップショットに記録され、未定義値が拒否されることを確認する。
+    [Fact]
+    public async Task Priority_IsExposedInSnapshotAndUndefinedValueIsRejected()
+    {
+        await using var scheduler = new YatkScheduler();
+
+        var jobId = scheduler.Do(
+            _ => Task.CompletedTask,
+            priority: YatkJobPriority.High);
+
+        Assert.True(await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(YatkJobPriority.High, scheduler.GetJob(jobId)?.Priority);
+        Assert.Throws<ArgumentOutOfRangeException>(() => scheduler.Do(
+            _ => Task.CompletedTask,
+            priority: (YatkJobPriority)999));
+    }
+
+    // 複数の Immediate ジョブが最大並列度を超えて同時に開始できることを確認する。
+    [Fact]
+    public async Task ImmediateJobs_CanAllStartBeyondConcurrencyLimit()
+    {
+        var blockingJobStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseAll = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allImmediateJobsStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var immediateStartCount = 0;
+        await using var scheduler = new YatkScheduler(maxConcurrency: 1);
+
+        scheduler.Do(async _ =>
+        {
+            blockingJobStarted.SetResult();
+            await releaseAll.Task;
+        });
+        await blockingJobStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        for (var index = 0; index < 2; index++)
+        {
+            scheduler.Do(async _ =>
+            {
+                if (Interlocked.Increment(ref immediateStartCount) == 2)
+                {
+                    allImmediateJobsStarted.SetResult();
+                }
+
+                await releaseAll.Task;
+            }, priority: YatkJobPriority.Immediate);
+        }
+
+        try
+        {
+            await allImmediateJobsStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            releaseAll.TrySetResult();
+        }
+    }
+
+    // Cancel 停止が待機中の High と実行中の Immediate をキャンセルすることを確認する。
+    [Fact]
+    public async Task StopAsync_CancelHandlesHighAndImmediateJobs()
+    {
+        var normalStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var immediateStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var highExecuted = false;
+        await using var scheduler = new YatkScheduler(maxConcurrency: 1);
+
+        var normalJobId = scheduler.Do(async cancellationToken =>
+        {
+            normalStarted.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        });
+        await normalStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var highJobId = scheduler.Do(_ =>
+        {
+            highExecuted = true;
+            return Task.CompletedTask;
+        }, priority: YatkJobPriority.High);
+        var immediateJobId = scheduler.Do(async cancellationToken =>
+        {
+            immediateStarted.SetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }, priority: YatkJobPriority.Immediate);
+        await immediateStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await scheduler.StopAsync(YatkShutdownMode.Cancel).WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(YatkJobState.Canceled, scheduler.GetJob(normalJobId)?.State);
+        Assert.Equal(YatkJobState.Canceled, scheduler.GetJob(highJobId)?.State);
+        Assert.Equal(YatkJobState.Canceled, scheduler.GetJob(immediateJobId)?.State);
+        Assert.False(highExecuted);
+    }
+
+    // Immediate ジョブでも Queued、Running の順に優先度付きイベントが発生することを確認する。
+    [Fact]
+    public async Task ImmediateJob_RaisesQueuedAndRunningEventsInOrder()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var states = new List<YatkJobState>();
+        await using var scheduler = new YatkScheduler();
+
+        scheduler.JobChanged += (_, eventArgs) =>
+        {
+            Assert.Equal(YatkJobPriority.Immediate, eventArgs.Snapshot.Priority);
+            states.Add(eventArgs.Snapshot.State);
+        };
+
+        var jobId = scheduler.Do(
+            async _ => await release.Task,
+            priority: YatkJobPriority.Immediate);
+
+        try
+        {
+            Assert.Equal([YatkJobState.Queued, YatkJobState.Running], states);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        Assert.True(await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
     // キャンセル要求のイベントハンドラがブロックしてもキャンセルトークンが先に通知されることを確認する。
     [Fact]
     public async Task Cancel_PropagatesTokenBeforeInvokingCancelRequestedHandler()

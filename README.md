@@ -25,6 +25,8 @@ Yatk は、アプリケーション内で非同期ジョブを FIFO 順に実行
 - `JobChanged` による状態遷移通知
 - `Drain` / `Cancel` を選べる停止処理
 - 完了済みジョブの保持上限
+- 通常ジョブより先に待機する `High` 優先度
+- 最大並列度を超えて開始する `Immediate` 優先度
 
 ## 基本的な使い方
 
@@ -110,6 +112,28 @@ await scheduler.StopAsync(YatkShutdownMode.Drain);
 ```
 
 `MaxRetainedCompletedJobs` は完了済みジョブを保持する件数です。`0` を指定すると、完了と同時にスケジューラから削除されます。削除されたジョブは `GetJob` で取得できず、`Cancel` と `WaitForCompletionAsync` は `false` を返します。
+
+## 優先実行
+
+投入時に優先度を指定できます。
+
+```csharp
+// 通常の待機ジョブより先に、空いた実行枠へ割り当てる。
+scheduler.Do(
+    cancellationToken => RunImportantWorkAsync(cancellationToken),
+    name: "優先処理",
+    priority: YatkJobPriority.High);
+
+// 最大並列度に空きがなくても直ちに実行枠へ割り当てる。
+scheduler.Do(
+    cancellationToken => RunUrgentWorkAsync(cancellationToken),
+    name: "緊急処理",
+    priority: YatkJobPriority.Immediate);
+```
+
+`High` は実行中ジョブを中断せず、最大並列度も超えません。複数の `High` ジョブは投入順に実行枠へ割り当てられます。
+
+`Immediate` は最大並列度を超えて開始でき、連続投入による超過数に上限はありません。CPU、メモリ、外部サービスなどのリソース消費は利用者側で管理してください。ここでいう開始順は実行枠への割り当て順であり、ThreadPool 上でユーザーコードが実際に動き始める順序までは保証しません。
 
 ## リッチジョブ
 

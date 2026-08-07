@@ -12,4 +12,10 @@ public sealed record YatkJobSnapshot(
     DateTimeOffset? QueuedAt,
     DateTimeOffset? StartedAt,
     DateTimeOffset? CompletedAt,
-    Exception? Exception);
+    Exception? Exception)
+{
+    /// <summary>
+    /// ジョブ投入時に指定された優先度を取得します。
+    /// </summary>
+    public YatkJobPriority Priority { get; init; } = YatkJobPriority.Normal;
+}

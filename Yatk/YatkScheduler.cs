@@ -7,6 +7,7 @@ public sealed class YatkScheduler : IAsyncDisposable
 {
     private readonly object syncRoot = new();
     private readonly LinkedList<JobEntry> queuedJobs = new();
+    private readonly LinkedList<JobEntry> highPriorityQueuedJobs = new();
     private readonly Dictionary<YatkJobId, JobEntry> jobs = new();
     private readonly Queue<YatkJobId> completedJobIds = new();
     private readonly Queue<YatkJobSnapshot> pendingJobChanges = new();
@@ -72,14 +73,18 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// </summary>
     /// <param name="action">実行する非同期処理です。</param>
     /// <param name="name">ジョブを識別する任意の名前です。</param>
+    /// <param name="priority">ジョブの実行優先度です。</param>
     /// <returns>投入したジョブの ID です。</returns>
     /// <exception cref="ArgumentNullException"><paramref name="action"/> が <see langword="null"/> の場合に発生します。</exception>
     /// <exception cref="ObjectDisposedException">スケジューラが停止済みの場合に発生します。</exception>
-    public YatkJobId Do(Func<CancellationToken, Task> action, string? name = null)
+    public YatkJobId Do(
+        Func<CancellationToken, Task> action,
+        string? name = null,
+        YatkJobPriority priority = YatkJobPriority.Normal)
     {
         ArgumentNullException.ThrowIfNull(action);
 
-        return Do((_, cancellationToken) => action(cancellationToken), name);
+        return Do((_, cancellationToken) => action(cancellationToken), name, priority);
     }
 
     /// <summary>
@@ -87,27 +92,35 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// </summary>
     /// <param name="action">実行する非同期処理です。</param>
     /// <param name="name">ジョブを識別する任意の名前です。</param>
+    /// <param name="priority">ジョブの実行優先度です。</param>
     /// <returns>投入したジョブの ID です。</returns>
     /// <exception cref="ArgumentNullException"><paramref name="action"/> が <see langword="null"/> の場合に発生します。</exception>
     /// <exception cref="ObjectDisposedException">スケジューラが停止済みの場合に発生します。</exception>
-    public YatkJobId Do(Func<YatkJobContext, CancellationToken, Task> action, string? name = null)
+    public YatkJobId Do(
+        Func<YatkJobContext, CancellationToken, Task> action,
+        string? name = null,
+        YatkJobPriority priority = YatkJobPriority.Normal)
     {
         ArgumentNullException.ThrowIfNull(action);
 
-        return Enqueue(new DelegateJob(action, name));
+        return Enqueue(new DelegateJob(action, name), priority);
     }
 
     /// <summary>
     /// リッチジョブをキューへ投入します。
     /// </summary>
     /// <param name="job">実行するジョブです。</param>
+    /// <param name="priority">ジョブの実行優先度です。</param>
     /// <returns>投入したジョブの ID です。</returns>
     /// <exception cref="ArgumentNullException"><paramref name="job"/> が <see langword="null"/> の場合に発生します。</exception>
     /// <exception cref="InvalidOperationException">ジョブがすでに投入済みの場合に発生します。</exception>
     /// <exception cref="ObjectDisposedException">スケジューラが停止済みの場合に発生します。</exception>
-    public YatkJobId Enqueue(YatkJobBase job)
+    public YatkJobId Enqueue(
+        YatkJobBase job,
+        YatkJobPriority priority = YatkJobPriority.Normal)
     {
         ArgumentNullException.ThrowIfNull(job);
+        ValidatePriority(priority);
 
         YatkJobSnapshot snapshot;
 
@@ -120,12 +133,20 @@ public sealed class YatkScheduler : IAsyncDisposable
                 throw new InvalidOperationException("同じジョブを複数回投入することはできません。");
             }
 
-            var entry = new JobEntry(job);
+            var entry = new JobEntry(job, priority);
             jobs.Add(job.JobId, entry);
-            entry.QueueNode = queuedJobs.AddLast(entry);
-            snapshot = job.CreateSnapshot();
+            snapshot = CreateSnapshot(entry);
             EnqueueJobChanged(snapshot);
-            StartAvailableJobs();
+            if (priority == YatkJobPriority.Immediate)
+            {
+                StartJob(entry);
+            }
+            else
+            {
+                var queue = priority == YatkJobPriority.High ? highPriorityQueuedJobs : queuedJobs;
+                entry.QueueNode = queue.AddLast(entry);
+                StartAvailableJobs();
+            }
         }
 
         DispatchJobChanges();
@@ -141,7 +162,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         lock (syncRoot)
         {
-            return jobs.TryGetValue(jobId, out var entry) ? entry.Job.CreateSnapshot() : null;
+            return jobs.TryGetValue(jobId, out var entry) ? CreateSnapshot(entry) : null;
         }
     }
 
@@ -153,7 +174,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         lock (syncRoot)
         {
-            return jobs.Values.Select(entry => entry.Job.CreateSnapshot()).ToArray();
+            return jobs.Values.Select(CreateSnapshot).ToArray();
         }
     }
 
@@ -177,13 +198,13 @@ public sealed class YatkScheduler : IAsyncDisposable
             if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
             {
                 RemoveQueuedJob(entry);
-                snapshot = entry.Job.CreateSnapshot();
+                snapshot = CreateSnapshot(entry);
                 RecordCompletion(entry);
             }
             else if (entry.Job.TryMarkCancelRequested())
             {
                 cancellationTokenSource = entry.CancellationTokenSource;
-                snapshot = entry.Job.CreateSnapshot();
+                snapshot = CreateSnapshot(entry);
             }
             else
             {
@@ -269,15 +290,12 @@ public sealed class YatkScheduler : IAsyncDisposable
                 {
                     cancellationTokenSources = new List<CancellationTokenSource>();
 
-                    while (queuedJobs.First is not null)
+                    while (TryTakeNextQueuedJob(out var queuedEntry))
                     {
-                        var entry = queuedJobs.First.Value;
-                        queuedJobs.RemoveFirst();
-                        entry.QueueNode = null;
-                        if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
+                        if (queuedEntry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
                         {
-                            EnqueueJobChanged(entry.Job.CreateSnapshot());
-                            RecordCompletion(entry);
+                            EnqueueJobChanged(CreateSnapshot(queuedEntry));
+                            RecordCompletion(queuedEntry);
                         }
                     }
 
@@ -285,7 +303,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                     {
                         if (entry.Job.TryMarkCancelRequested())
                         {
-                            EnqueueJobChanged(entry.Job.CreateSnapshot());
+                            EnqueueJobChanged(CreateSnapshot(entry));
                             cancellationTokenSources.Add(entry.CancellationTokenSource);
                         }
                     }
@@ -350,21 +368,38 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     private void StartAvailableJobs()
     {
-        while (runningCount < maxConcurrency && queuedJobs.First is not null)
+        while (runningCount < maxConcurrency && TryTakeNextQueuedJob(out var entry))
         {
-            var entry = queuedJobs.First.Value;
-            queuedJobs.RemoveFirst();
-            entry.QueueNode = null;
-            if (!entry.Job.TryMarkRunning(DateTimeOffset.UtcNow))
-            {
-                continue;
-            }
-
-            var runningSnapshot = entry.Job.CreateSnapshot();
-            EnqueueJobChanged(runningSnapshot);
-            runningCount++;
-            _ = Task.Run(() => ProcessJobAsync(entry));
+            StartJob(entry);
         }
+    }
+
+    private void StartJob(JobEntry entry)
+    {
+        if (!entry.Job.TryMarkRunning(DateTimeOffset.UtcNow))
+        {
+            return;
+        }
+
+        var runningSnapshot = CreateSnapshot(entry);
+        EnqueueJobChanged(runningSnapshot);
+        runningCount++;
+        _ = Task.Run(() => ProcessJobAsync(entry));
+    }
+
+    private bool TryTakeNextQueuedJob(out JobEntry entry)
+    {
+        var queue = highPriorityQueuedJobs.First is not null ? highPriorityQueuedJobs : queuedJobs;
+        if (queue.First is null)
+        {
+            entry = null!;
+            return false;
+        }
+
+        entry = queue.First.Value;
+        queue.RemoveFirst();
+        entry.QueueNode = null;
+        return true;
     }
 
     private void MarkSucceeded(JobEntry entry)
@@ -372,7 +407,7 @@ public sealed class YatkScheduler : IAsyncDisposable
         lock (syncRoot)
         {
             entry.Job.MarkSucceeded(DateTimeOffset.UtcNow);
-            var snapshot = entry.Job.CreateSnapshot();
+            var snapshot = CreateSnapshot(entry);
             RecordCompletion(entry);
             EnqueueJobChanged(snapshot);
         }
@@ -387,7 +422,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                 return;
             }
 
-            var snapshot = entry.Job.CreateSnapshot();
+            var snapshot = CreateSnapshot(entry);
             RecordCompletion(entry);
             EnqueueJobChanged(snapshot);
         }
@@ -398,7 +433,7 @@ public sealed class YatkScheduler : IAsyncDisposable
         lock (syncRoot)
         {
             entry.Job.MarkFailed(DateTimeOffset.UtcNow, exception);
-            var snapshot = entry.Job.CreateSnapshot();
+            var snapshot = CreateSnapshot(entry);
             RecordCompletion(entry);
             EnqueueJobChanged(snapshot);
         }
@@ -438,7 +473,10 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     private void TryCompleteStop()
     {
-        if (stopCompletion is not null && queuedJobs.Count == 0 && runningCount == 0)
+        if (stopCompletion is not null
+            && queuedJobs.Count == 0
+            && highPriorityQueuedJobs.Count == 0
+            && runningCount == 0)
         {
             stopCompletion.TrySetResult();
         }
@@ -462,7 +500,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         if (entry.QueueNode is not null)
         {
-            queuedJobs.Remove(entry.QueueNode);
+            entry.QueueNode.List?.Remove(entry.QueueNode);
             entry.QueueNode = null;
         }
     }
@@ -586,6 +624,19 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
     }
 
+    private static void ValidatePriority(YatkJobPriority priority)
+    {
+        if (!Enum.IsDefined(priority))
+        {
+            throw new ArgumentOutOfRangeException(nameof(priority));
+        }
+    }
+
+    private static YatkJobSnapshot CreateSnapshot(JobEntry entry)
+    {
+        return entry.Job.CreateSnapshot() with { Priority = entry.Priority };
+    }
+
     private sealed class DelegateJob : YatkJobBase
     {
         private readonly Func<YatkJobContext, CancellationToken, Task> action;
@@ -604,13 +655,16 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     private sealed class JobEntry
     {
-        public JobEntry(YatkJobBase job)
+        public JobEntry(YatkJobBase job, YatkJobPriority priority)
         {
             Job = job;
+            Priority = priority;
             CancellationTokenSource = new CancellationTokenSource();
         }
 
         public YatkJobBase Job { get; }
+
+        public YatkJobPriority Priority { get; }
 
         public CancellationTokenSource CancellationTokenSource { get; }
 
