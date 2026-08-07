@@ -5,8 +5,9 @@ namespace Yatk;
 /// </summary>
 public sealed class YatkJobContext
 {
+    private readonly object syncRoot = new();
     private readonly YatkJobBase job;
-    private int isActive = 1;
+    private bool isActive = true;
 
     internal YatkJobContext(YatkJobBase job)
     {
@@ -30,9 +31,12 @@ public sealed class YatkJobContext
             throw new ArgumentOutOfRangeException(nameof(progress));
         }
 
-        if (Volatile.Read(ref isActive) == 1)
+        lock (syncRoot)
         {
-            job.SetProgress(progress);
+            if (isActive)
+            {
+                job.SetProgress(progress);
+            }
         }
     }
 
@@ -42,14 +46,20 @@ public sealed class YatkJobContext
     /// <param name="message">設定するメッセージ。<see langword="null"/> を指定するとメッセージをクリアします。</param>
     public void SetStatusMessage(string? message)
     {
-        if (Volatile.Read(ref isActive) == 1)
+        lock (syncRoot)
         {
-            job.SetStatusMessage(message);
+            if (isActive)
+            {
+                job.SetStatusMessage(message);
+            }
         }
     }
 
     internal void Invalidate()
     {
-        Interlocked.Exchange(ref isActive, 0);
+        lock (syncRoot)
+        {
+            isActive = false;
+        }
     }
 }

@@ -817,6 +817,58 @@ public sealed class YatkSchedulerTests
         Assert.Null(snapshot.StatusMessage);
     }
 
+    // 完了処理と同時に開始されたコンテキスト更新が、完了後のスナップショットを書き換えないことを確認する。
+    [Fact]
+    public async Task JobContext_ConcurrentUpdateDoesNotChangeSnapshotAfterCompletion()
+    {
+        const int attemptCount = 100;
+        const int reporterCount = 4;
+
+        for (var attempt = 0; attempt < attemptCount; attempt++)
+        {
+            var contextCaptured = new TaskCompletionSource<YatkJobContext>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseJob = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var allReportersStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var startedReporterCount = 0;
+            var stopReporting = 0;
+            await using var scheduler = new YatkScheduler();
+
+            var jobId = scheduler.Do(async (context, _) =>
+            {
+                contextCaptured.SetResult(context);
+                await releaseJob.Task;
+            });
+
+            var context = await contextCaptured.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var reporters = Enumerable.Range(0, reporterCount)
+                .Select(reporterIndex => Task.Run(() =>
+                {
+                    if (Interlocked.Increment(ref startedReporterCount) == reporterCount)
+                    {
+                        allReportersStarted.SetResult();
+                    }
+
+                    var updateIndex = 0;
+                    while (Volatile.Read(ref stopReporting) == 0)
+                    {
+                        context.SetStatusMessage($"reporter-{reporterIndex}-{updateIndex++}");
+                    }
+                }))
+                .ToArray();
+
+            await allReportersStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            releaseJob.SetResult();
+            Assert.True(await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5)));
+
+            var snapshotAtCompletion = scheduler.GetJob(jobId);
+            Volatile.Write(ref stopReporting, 1);
+            await Task.WhenAll(reporters).WaitAsync(TimeSpan.FromSeconds(5));
+            var snapshotAfterReporters = scheduler.GetJob(jobId);
+
+            Assert.Equal(snapshotAtCompletion?.StatusMessage, snapshotAfterReporters?.StatusMessage);
+        }
+    }
+
     // キャンセル要求のイベントハンドラがブロックしてもキャンセルトークンが先に通知されることを確認する。
     [Fact]
     public async Task Cancel_PropagatesTokenBeforeInvokingCancelRequestedHandler()
