@@ -199,6 +199,45 @@ public sealed class YatkSchedulerTests
         Assert.Equal("処理中", snapshot.StatusMessage);
     }
 
+    // ジョブコンテキストから報告した内容が変更イベントで通知されることを確認する。
+    [Fact]
+    public async Task JobContext_ReportRaisesJobChanged()
+    {
+        var reported = new TaskCompletionSource<YatkJobSnapshot>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+        scheduler.JobChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.Snapshot.StatusMessage == "処理中")
+            {
+                reported.TrySetResult(eventArgs.Snapshot);
+            }
+        };
+
+        var jobId = scheduler.Do(async (context, _) =>
+        {
+            context.ReportProgress(0.5);
+            context.SetStatusMessage("処理中");
+            await release.Task;
+        });
+
+        try
+        {
+            var snapshot = await reported.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.Equal(jobId, snapshot.JobId);
+            Assert.Equal(YatkJobState.Running, snapshot.State);
+            Assert.Equal(0.5, snapshot.Progress);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     // 状態メッセージを null に設定するとスナップショットからクリアされることを確認する。
     [Fact]
     public async Task JobContext_ClearsStatusMessageWithNull()

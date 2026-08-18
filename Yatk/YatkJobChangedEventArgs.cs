@@ -1,7 +1,7 @@
 namespace Yatk;
 
 /// <summary>
-/// ジョブ状態の変更を通知するイベント引数です。
+/// ジョブ情報の変更を通知するイベント引数です。
 /// </summary>
 public sealed class YatkJobChangedEventArgs : EventArgs
 {
@@ -15,7 +15,7 @@ public sealed class YatkJobChangedEventArgs : EventArgs
     }
 
     /// <summary>
-    /// 状態が変更されたジョブの ID を取得します。
+    /// 情報が変更されたジョブの ID を取得します。
     /// </summary>
     public YatkJobId JobId => Snapshot.JobId;
 
