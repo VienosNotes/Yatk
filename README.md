@@ -71,7 +71,7 @@ var jobId = scheduler.Do(async (context, cancellationToken) =>
 
 ## 状態の監視とキャンセル
 
-`JobChanged` は状態遷移ごとに通知されます。通知は `Queued`、`Running`、`Succeeded` のような状態遷移順に配送され、イベント引数の `Snapshot` がその通知時点の状態を表します。
+`JobChanged` は状態遷移と、進捗または状態メッセージの報告ごとに通知されます。通知は報告された順に配送され、イベント引数の `Snapshot` がその通知時点の状態を表します。
 
 ```csharp
 scheduler.JobChanged += (_, eventArgs) =>

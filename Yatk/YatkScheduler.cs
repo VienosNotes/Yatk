@@ -19,7 +19,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     private TaskCompletionSource? stopCompletion;
 
     /// <summary>
-    /// ジョブの状態が変更されたときに発生します。
+    /// ジョブの状態、進捗、状態メッセージが変更されたときに発生します。
     /// </summary>
     public event EventHandler<YatkJobChangedEventArgs>? JobChanged;
 
@@ -346,7 +346,10 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         try
         {
-            await entry.Job.ExecuteInternalAsync(entry.CancellationTokenSource.Token).ConfigureAwait(false);
+            await entry.Job.ExecuteInternalAsync(
+                    entry.CancellationTokenSource.Token,
+                    () => OnJobReported(entry))
+                .ConfigureAwait(false);
             MarkSucceeded(entry);
             DispatchJobChanges();
         }
@@ -385,6 +388,19 @@ public sealed class YatkScheduler : IAsyncDisposable
         EnqueueJobChanged(runningSnapshot);
         runningCount++;
         _ = Task.Run(() => ProcessJobAsync(entry));
+    }
+
+    /// <summary>
+    /// ジョブから報告された進捗または状態メッセージを変更通知へ反映します。
+    /// </summary>
+    private void OnJobReported(JobEntry entry)
+    {
+        lock (syncRoot)
+        {
+            EnqueueJobChanged(CreateSnapshot(entry));
+        }
+
+        DispatchJobChanges();
     }
 
     private bool TryTakeNextQueuedJob(out JobEntry entry)

@@ -7,11 +7,13 @@ public sealed class YatkJobContext
 {
     private readonly object syncRoot = new();
     private readonly YatkJobBase job;
+    private readonly Action jobChanged;
     private bool isActive = true;
 
-    internal YatkJobContext(YatkJobBase job)
+    internal YatkJobContext(YatkJobBase job, Action jobChanged)
     {
         this.job = job;
+        this.jobChanged = jobChanged;
     }
 
     /// <summary>
@@ -31,12 +33,23 @@ public sealed class YatkJobContext
             throw new ArgumentOutOfRangeException(nameof(progress));
         }
 
+        bool changed;
         lock (syncRoot)
         {
             if (isActive)
             {
                 job.SetProgress(progress);
+                changed = true;
             }
+            else
+            {
+                changed = false;
+            }
+        }
+
+        if (changed)
+        {
+            jobChanged();
         }
     }
 
@@ -46,12 +59,23 @@ public sealed class YatkJobContext
     /// <param name="message">設定するメッセージ。<see langword="null"/> を指定するとメッセージをクリアします。</param>
     public void SetStatusMessage(string? message)
     {
+        bool changed;
         lock (syncRoot)
         {
             if (isActive)
             {
                 job.SetStatusMessage(message);
+                changed = true;
             }
+            else
+            {
+                changed = false;
+            }
+        }
+
+        if (changed)
+        {
+            jobChanged();
         }
     }
 

@@ -183,9 +183,9 @@ public abstract class YatkJobBase
         }
     }
 
-    internal async Task ExecuteInternalAsync(CancellationToken cancellationToken)
+    internal async Task ExecuteInternalAsync(CancellationToken cancellationToken, Action jobChanged)
     {
-        var context = new YatkJobContext(this);
+        var context = new YatkJobContext(this, jobChanged);
 
         try
         {
