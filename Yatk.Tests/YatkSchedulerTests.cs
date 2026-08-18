@@ -757,7 +757,7 @@ public sealed class YatkSchedulerTests
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var terminalStateChanged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var removedDuringHandler = false;
         await using var scheduler = new YatkScheduler(new YatkSchedulerOptions
         {
             MaxRetainedCompletedJobs = 0,
@@ -778,20 +778,16 @@ public sealed class YatkSchedulerTests
             if (eventArgs.Snapshot.State == YatkJobState.CancelRequested)
             {
                 release.SetResult();
-                if (!terminalStateChanged.Task.Wait(TimeSpan.FromSeconds(5)))
-                {
-                    throw new TimeoutException("ジョブが完了しませんでした。");
-                }
-            }
-            else if (eventArgs.Snapshot.State == YatkJobState.Succeeded)
-            {
-                terminalStateChanged.SetResult();
+                removedDuringHandler = SpinWait.SpinUntil(
+                    () => scheduler.GetJob(jobId) is null,
+                    TimeSpan.FromSeconds(5));
             }
         };
 
         await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.True(scheduler.Cancel(jobId));
+        Assert.True(removedDuringHandler);
     }
 
     // 完了後に保持されたコンテキストから状態を更新してもスナップショットが変化しないことを確認する。
@@ -841,7 +837,7 @@ public sealed class YatkSchedulerTests
 
             var context = await contextCaptured.Task.WaitAsync(TimeSpan.FromSeconds(5));
             var reporters = Enumerable.Range(0, reporterCount)
-                .Select(reporterIndex => Task.Run(() =>
+                .Select(reporterIndex => Task.Factory.StartNew(() =>
                 {
                     if (Interlocked.Increment(ref startedReporterCount) == reporterCount)
                     {
@@ -852,17 +848,26 @@ public sealed class YatkSchedulerTests
                     while (Volatile.Read(ref stopReporting) == 0)
                     {
                         context.SetStatusMessage($"reporter-{reporterIndex}-{updateIndex++}");
+                        Thread.Yield();
                     }
-                }))
+                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default))
                 .ToArray();
 
-            await allReportersStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            releaseJob.SetResult();
-            Assert.True(await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5)));
+            YatkJobSnapshot? snapshotAtCompletion;
+            try
+            {
+                await allReportersStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                releaseJob.SetResult();
+                Assert.True(await scheduler.WaitForCompletionAsync(jobId).WaitAsync(TimeSpan.FromSeconds(5)));
+                snapshotAtCompletion = scheduler.GetJob(jobId);
+            }
+            finally
+            {
+                releaseJob.TrySetResult();
+                Volatile.Write(ref stopReporting, 1);
+                await Task.WhenAll(reporters).WaitAsync(TimeSpan.FromSeconds(5));
+            }
 
-            var snapshotAtCompletion = scheduler.GetJob(jobId);
-            Volatile.Write(ref stopReporting, 1);
-            await Task.WhenAll(reporters).WaitAsync(TimeSpan.FromSeconds(5));
             var snapshotAfterReporters = scheduler.GetJob(jobId);
 
             Assert.Equal(snapshotAtCompletion?.StatusMessage, snapshotAfterReporters?.StatusMessage);
