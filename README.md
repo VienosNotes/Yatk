@@ -72,12 +72,13 @@ var jobId = scheduler.Do(async (context, cancellationToken) =>
 ## 状態の監視とキャンセル
 
 `JobChanged` は状態遷移と、進捗または状態メッセージの報告ごとに通知されます。通知は報告された順に配送され、イベント引数の `Snapshot` がその通知時点の状態を表します。
+`Snapshot.ChangedAt` には、その通知が表す変更（状態遷移、進捗・状態メッセージの報告）の発生時刻が UTC で記録されます。状態遷移の通知では、`QueuedAt`、`StartedAt`、`CompletedAt` のうち対応する時刻と同じ値になります。
 
 ```csharp
 scheduler.JobChanged += (_, eventArgs) =>
 {
     var snapshot = eventArgs.Snapshot;
-    Console.WriteLine($"{snapshot.Name}: {snapshot.State}");
+    Console.WriteLine($"{snapshot.ChangedAt:O} {snapshot.Name}: {snapshot.State}");
 };
 
 var jobId = scheduler.Do(async cancellationToken =>
