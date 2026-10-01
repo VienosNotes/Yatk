@@ -201,7 +201,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                 snapshot = CreateSnapshot(entry);
                 RecordCompletion(entry);
             }
-            else if (entry.Job.TryMarkCancelRequested())
+            else if (entry.Job.TryMarkCancelRequested(DateTimeOffset.UtcNow))
             {
                 cancellationTokenSource = entry.CancellationTokenSource;
                 snapshot = CreateSnapshot(entry);
@@ -301,7 +301,7 @@ public sealed class YatkScheduler : IAsyncDisposable
 
                     foreach (var entry in jobs.Values)
                     {
-                        if (entry.Job.TryMarkCancelRequested())
+                        if (entry.Job.TryMarkCancelRequested(DateTimeOffset.UtcNow))
                         {
                             EnqueueJobChanged(CreateSnapshot(entry));
                             cancellationTokenSources.Add(entry.CancellationTokenSource);

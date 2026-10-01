@@ -38,7 +38,7 @@ public sealed class YatkJobContext
         {
             if (isActive)
             {
-                job.SetProgress(progress);
+                job.SetProgress(progress, DateTimeOffset.UtcNow);
                 changed = true;
             }
             else
@@ -64,7 +64,7 @@ public sealed class YatkJobContext
         {
             if (isActive)
             {
-                job.SetStatusMessage(message);
+                job.SetStatusMessage(message, DateTimeOffset.UtcNow);
                 changed = true;
             }
             else

@@ -10,6 +10,7 @@ public abstract class YatkJobBase
     private DateTimeOffset? queuedAt;
     private DateTimeOffset? startedAt;
     private DateTimeOffset? completedAt;
+    private DateTimeOffset changedAt;
     private Exception? exception;
     private double? progress;
     private string? statusMessage;
@@ -97,6 +98,7 @@ public abstract class YatkJobBase
 
             state = YatkJobState.Queued;
             queuedAt = timestamp;
+            changedAt = timestamp;
             return true;
         }
     }
@@ -112,11 +114,12 @@ public abstract class YatkJobBase
 
             state = YatkJobState.Running;
             startedAt = timestamp;
+            changedAt = timestamp;
             return true;
         }
     }
 
-    internal bool TryMarkCancelRequested()
+    internal bool TryMarkCancelRequested(DateTimeOffset timestamp)
     {
         lock (syncRoot)
         {
@@ -126,6 +129,7 @@ public abstract class YatkJobBase
             }
 
             state = YatkJobState.CancelRequested;
+            changedAt = timestamp;
             return true;
         }
     }
@@ -141,6 +145,7 @@ public abstract class YatkJobBase
 
             state = YatkJobState.Canceled;
             completedAt = timestamp;
+            changedAt = timestamp;
             completion.TrySetResult();
             return true;
         }
@@ -157,6 +162,7 @@ public abstract class YatkJobBase
 
             state = YatkJobState.Canceled;
             completedAt = timestamp;
+            changedAt = timestamp;
             completion.TrySetResult();
             return true;
         }
@@ -168,6 +174,7 @@ public abstract class YatkJobBase
         {
             state = YatkJobState.Succeeded;
             completedAt = timestamp;
+            changedAt = timestamp;
             completion.TrySetResult();
         }
     }
@@ -178,6 +185,7 @@ public abstract class YatkJobBase
         {
             state = YatkJobState.Failed;
             completedAt = timestamp;
+            changedAt = timestamp;
             exception = error;
             completion.TrySetResult();
         }
@@ -197,19 +205,21 @@ public abstract class YatkJobBase
         }
     }
 
-    internal void SetProgress(double value)
+    internal void SetProgress(double value, DateTimeOffset timestamp)
     {
         lock (syncRoot)
         {
             progress = value;
+            changedAt = timestamp;
         }
     }
 
-    internal void SetStatusMessage(string? message)
+    internal void SetStatusMessage(string? message, DateTimeOffset timestamp)
     {
         lock (syncRoot)
         {
             statusMessage = message;
+            changedAt = timestamp;
         }
     }
 
@@ -231,7 +241,10 @@ public abstract class YatkJobBase
                 queuedAt,
                 startedAt,
                 completedAt,
-                exception);
+                exception)
+            {
+                ChangedAt = changedAt,
+            };
         }
     }
 }

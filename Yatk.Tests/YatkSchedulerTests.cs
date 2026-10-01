@@ -489,6 +489,64 @@ public sealed class YatkSchedulerTests
             states.ToArray());
     }
 
+    // 状態変更イベントのスナップショットに、各変更の発生時刻が記録されることを確認する。
+    [Fact]
+    public async Task JobChanged_SnapshotRecordsChangedAt()
+    {
+        var snapshots = new ConcurrentQueue<YatkJobSnapshot>();
+        var cancelRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var canceledNotified = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler();
+        scheduler.JobChanged += (_, eventArgs) =>
+        {
+            snapshots.Enqueue(eventArgs.Snapshot);
+            if (eventArgs.Snapshot.State == YatkJobState.Canceled)
+            {
+                canceledNotified.TrySetResult();
+            }
+        };
+
+        var before = DateTimeOffset.UtcNow;
+        var jobId = scheduler.Do(async (context, cancellationToken) =>
+        {
+            context.ReportProgress(0.5);
+            started.SetResult();
+            await cancelRequested.Task;
+            cancellationToken.ThrowIfCancellationRequested();
+        });
+
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(scheduler.Cancel(jobId));
+        cancelRequested.SetResult();
+
+        // 完了待機は最後の通知の配送前に戻り得るため、終了状態の通知そのものを待つ。
+        await canceledNotified.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var after = DateTimeOffset.UtcNow;
+
+        var received = snapshots.ToArray();
+        Assert.Equal(
+            [YatkJobState.Queued, YatkJobState.Running, YatkJobState.Running, YatkJobState.CancelRequested, YatkJobState.Canceled],
+            received.Select(snapshot => snapshot.State));
+
+        // 状態遷移の通知では、対応する遷移時刻と一致する。
+        Assert.Equal(received[0].QueuedAt, received[0].ChangedAt);
+        Assert.Equal(received[1].StartedAt, received[1].ChangedAt);
+        Assert.Equal(received[4].CompletedAt, received[4].ChangedAt);
+
+        // 通知順に時刻が単調増加し、すべて実行期間内に収まる。
+        for (var i = 0; i < received.Length; i++)
+        {
+            Assert.InRange(received[i].ChangedAt, before, after);
+            if (i > 0)
+            {
+                Assert.True(received[i - 1].ChangedAt <= received[i].ChangedAt);
+            }
+        }
+
+        Assert.Equal(received[4].ChangedAt, scheduler.GetJob(jobId)?.ChangedAt);
+    }
+
     // イベントハンドラの例外でジョブ実行が停止しないことを確認する。
     [Fact]
     public async Task JobChanged_HandlerExceptionDoesNotStopScheduler()
