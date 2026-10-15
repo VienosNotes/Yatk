@@ -377,6 +377,55 @@ public sealed class YatkSchedulerDelayTests
         await executed.Task.WaitAsync(Timeout);
     }
 
+    // システム時刻が戻っても、待ち時間の経過後に遅れずに実行されることを確認する。
+    [Fact]
+    public async Task DelayedJob_IsNotPostponedWhenSystemClockMovesBack()
+    {
+        var time = new ClockAdjustableTimeProvider();
+        var start = time.GetUtcNow();
+        var executed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler(timeProvider: time);
+
+        var jobId = scheduler.Do(_ =>
+        {
+            executed.SetResult();
+            return Task.CompletedTask;
+        }, delay: TimeSpan.FromSeconds(60));
+
+        time.AdjustClock(TimeSpan.FromHours(-1));
+        time.Advance(TimeSpan.FromSeconds(60));
+        await executed.Task.WaitAsync(Timeout);
+
+        // NotBefore は投入時点の時計で見た予定時刻のため、時計が戻ると QueuedAt が NotBefore より前になる。
+        var snapshot = scheduler.GetJob(jobId);
+        Assert.NotNull(snapshot);
+        Assert.Equal(start + TimeSpan.FromSeconds(60), snapshot.NotBefore);
+        Assert.Equal(start + TimeSpan.FromSeconds(60) - TimeSpan.FromHours(1), snapshot.QueuedAt);
+    }
+
+    // システム時刻が進んでも、待ち時間が経過していないジョブは実行されないことを確認する。
+    [Fact]
+    public async Task DelayedJob_IsNotAdvancedWhenSystemClockMovesForward()
+    {
+        var time = new ClockAdjustableTimeProvider();
+        var firstExecuted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var scheduler = new YatkScheduler(timeProvider: time);
+
+        scheduler.Do(_ =>
+        {
+            firstExecuted.SetResult();
+            return Task.CompletedTask;
+        }, delay: TimeSpan.FromSeconds(10));
+        var secondId = scheduler.Do(_ => Task.CompletedTask, delay: TimeSpan.FromSeconds(60));
+
+        // 先のジョブのタイマーが発火した時点で、後のジョブの NotBefore は時計の上では過ぎている。
+        time.AdjustClock(TimeSpan.FromHours(1));
+        time.Advance(TimeSpan.FromSeconds(10));
+        await firstExecuted.Task.WaitAsync(Timeout);
+
+        Assert.Equal(YatkJobState.Delayed, scheduler.GetJob(secondId)?.State);
+    }
+
     // どちらの停止方法でも、遅延待ちのジョブを待たずに取り消すことを確認する。
     [Theory]
     [InlineData(YatkShutdownMode.Drain)]
@@ -570,6 +619,46 @@ public sealed class YatkSchedulerDelayTests
         }
 
         Assert.False(reference.IsAlive);
+    }
+
+    /// <summary>
+    /// 単調な時計を変えずに、システム時刻だけをずらせる <see cref="TimeProvider"/> です。
+    /// </summary>
+    /// <remarks>
+    /// <see cref="FakeTimeProvider"/> は 2 つの時計を同じだけ進めるため、時計の補正を再現するために使う。
+    /// 単調な時計とタイマーは内部の <see cref="FakeTimeProvider"/> に任せる。
+    /// </remarks>
+    private sealed class ClockAdjustableTimeProvider : TimeProvider
+    {
+        private readonly FakeTimeProvider inner = new();
+        private TimeSpan clockOffset;
+
+        public override long TimestampFrequency => inner.TimestampFrequency;
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            return inner.GetUtcNow() + clockOffset;
+        }
+
+        public override long GetTimestamp()
+        {
+            return inner.GetTimestamp();
+        }
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            return inner.CreateTimer(callback, state, dueTime, period);
+        }
+
+        public void AdjustClock(TimeSpan offset)
+        {
+            clockOffset += offset;
+        }
+
+        public void Advance(TimeSpan delta)
+        {
+            inner.Advance(delta);
+        }
     }
 
     private sealed class NoOpJob : YatkJobBase

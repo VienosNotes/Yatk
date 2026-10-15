@@ -181,7 +181,12 @@ public sealed class YatkScheduler : IAsyncDisposable
                     throw new InvalidOperationException("同じジョブを複数回投入することはできません。");
                 }
 
-                var entry = new JobEntry(job, priority, now + delay, nextSequence++);
+                // 期限は単調な時計で判定する。NotBefore は投入時点の時計で見た予定時刻で、表示にだけ使う。
+                var nowTimestamp = timeProvider.GetTimestamp();
+                var entry = new JobEntry(job, priority, now + delay, nextSequence++)
+                {
+                    DueTimestamp = AddToTimestamp(nowTimestamp, delay),
+                };
                 jobs.Add(job.JobId, entry);
                 EnqueueJobChanged(CreateSnapshot(entry));
                 delayedJobs.Add(entry);
@@ -189,7 +194,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                 // 先頭が変わった場合だけ、タイマーの期限を早める必要がある。
                 if (delayedJobs.Min == entry)
                 {
-                    RescheduleDelayTimer(now);
+                    RescheduleDelayTimer(nowTimestamp);
                 }
             }
             else
@@ -257,7 +262,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                 RemoveQueuedJob(entry);
                 if (delayedJobs.Remove(entry))
                 {
-                    RescheduleDelayTimer(timeProvider.GetUtcNow());
+                    RescheduleDelayTimer(timeProvider.GetTimestamp());
                 }
 
                 snapshot = CreateSnapshot(entry);
@@ -473,8 +478,9 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// 遅延待ちのタイマーが発火したときに、時刻が来たジョブを待機キューへ加えます。
     /// </summary>
     /// <remarks>
-    /// タイマーは「そろそろ確認する」合図としてだけ扱い、時刻が来たかどうかは <see cref="TimeProvider.GetUtcNow"/> で判定し直します。
-    /// システム時刻の変更や、設定し直す前のタイマーの遅れた発火があっても、期限前のジョブは待機キューへ加えません。
+    /// タイマーは「そろそろ確認する」合図としてだけ扱い、期限が来たかどうかは <see cref="TimeProvider.GetTimestamp"/> の単調な時計で判定し直します。
+    /// 設定し直す前のタイマーが遅れて発火しても、期限前のジョブは待機キューへ加えません。
+    /// システム時刻の変更は判定に影響しないため、時計が戻っても実行は遅れず、進んでも早まりません。
     /// </remarks>
     private void OnDelayTimerFired()
     {
@@ -494,10 +500,11 @@ public sealed class YatkScheduler : IAsyncDisposable
                 return;
             }
 
+            var nowTimestamp = timeProvider.GetTimestamp();
             var now = timeProvider.GetUtcNow();
 
-            // NotBefore と投入順で整列しているため、先頭から取り出すことで順序を保つ。
-            while (delayedJobs.Min is { } entry && entry.NotBefore <= now)
+            // 期限と投入順で整列しているため、先頭から取り出すことで順序を保つ。
+            while (delayedJobs.Min is { } entry && entry.DueTimestamp <= nowTimestamp)
             {
                 delayedJobs.Remove(entry);
                 if (entry.Job.TryMarkReady(now))
@@ -507,7 +514,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                 }
             }
 
-            RescheduleDelayTimer(now);
+            RescheduleDelayTimer(nowTimestamp);
         }
 
         DispatchJobChanges();
@@ -519,7 +526,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// <remarks>
     /// 呼び出し元は <see cref="syncRoot"/> を保持している必要があります。
     /// </remarks>
-    private void RescheduleDelayTimer(DateTimeOffset now)
+    private void RescheduleDelayTimer(long nowTimestamp)
     {
         if (delayedJobs.Min is not { } next)
         {
@@ -527,14 +534,22 @@ public sealed class YatkScheduler : IAsyncDisposable
             return;
         }
 
-        var dueTime = next.NotBefore!.Value - now;
-        if (dueTime < MinTimerDueTime)
+        // 期限より前に発火しないよう、切り上げて TimeSpan の刻みへ変換する。
+        var remainingTicks = CeilingDivide(
+            ((Int128)next.DueTimestamp - nowTimestamp) * TimeSpan.TicksPerSecond,
+            timeProvider.TimestampFrequency);
+        TimeSpan dueTime;
+        if (remainingTicks < MinTimerDueTime.Ticks)
         {
             dueTime = MinTimerDueTime;
         }
-        else if (dueTime > MaxTimerDueTime)
+        else if (remainingTicks > MaxTimerDueTime.Ticks)
         {
             dueTime = MaxTimerDueTime;
+        }
+        else
+        {
+            dueTime = TimeSpan.FromTicks((long)remainingTicks);
         }
 
         if (delayTimer is null)
@@ -551,6 +566,27 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
 
         delayTimer.Change(dueTime, Timeout.InfiniteTimeSpan);
+    }
+
+    /// <summary>
+    /// 単調な時計のタイムスタンプに、待ち時間を加えた期限を求めます。
+    /// </summary>
+    /// <remarks>
+    /// 期限より前に実行しないよう、待ち時間はタイムスタンプの刻みへ切り上げて変換します。
+    /// 表現できない遠い期限は <see cref="long.MaxValue"/> に丸めます。この場合、ジョブは停止または取り消しまで実行されません。
+    /// </remarks>
+    private long AddToTimestamp(long timestamp, TimeSpan delay)
+    {
+        var due = timestamp + CeilingDivide(
+            (Int128)delay.Ticks * timeProvider.TimestampFrequency,
+            TimeSpan.TicksPerSecond);
+        return due > long.MaxValue ? long.MaxValue : (long)due;
+    }
+
+    private static Int128 CeilingDivide(Int128 dividend, long divisor)
+    {
+        var (quotient, remainder) = Int128.DivRem(dividend, divisor);
+        return remainder > 0 ? quotient + 1 : quotient;
     }
 
     private void StartAvailableJobs()
@@ -900,7 +936,12 @@ public sealed class YatkScheduler : IAsyncDisposable
         public DateTimeOffset? NotBefore { get; }
 
         /// <summary>
-        /// 投入順を表す連番です。同じ <see cref="NotBefore"/> のジョブを投入順に並べるために使います。
+        /// 遅延を指定して投入された場合の、実行可能になる期限です。<see cref="TimeProvider.GetTimestamp"/> の単調な時計で表します。
+        /// </summary>
+        public long DueTimestamp { get; init; }
+
+        /// <summary>
+        /// 投入順を表す連番です。同じ <see cref="DueTimestamp"/> のジョブを投入順に並べるために使います。
         /// </summary>
         public long Sequence { get; }
 
@@ -910,7 +951,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     }
 
     /// <summary>
-    /// 遅延待ちのジョブを、実行可能になる時刻、投入順の順に並べる比較子です。
+    /// 遅延待ちのジョブを、単調な時計で表した期限、投入順の順に並べる比較子です。
     /// </summary>
     private sealed class DelayedJobComparer : IComparer<JobEntry>
     {
@@ -933,7 +974,7 @@ public sealed class YatkScheduler : IAsyncDisposable
                 return 1;
             }
 
-            var result = x.NotBefore.GetValueOrDefault().CompareTo(y.NotBefore.GetValueOrDefault());
+            var result = x.DueTimestamp.CompareTo(y.DueTimestamp);
             return result != 0 ? result : x.Sequence.CompareTo(y.Sequence);
         }
     }
