@@ -7,12 +7,14 @@ public sealed class YatkJobContext
 {
     private readonly object syncRoot = new();
     private readonly YatkJobBase job;
+    private readonly TimeProvider timeProvider;
     private readonly Action jobChanged;
     private bool isActive = true;
 
-    internal YatkJobContext(YatkJobBase job, Action jobChanged)
+    internal YatkJobContext(YatkJobBase job, TimeProvider timeProvider, Action jobChanged)
     {
         this.job = job;
+        this.timeProvider = timeProvider;
         this.jobChanged = jobChanged;
     }
 
@@ -38,7 +40,7 @@ public sealed class YatkJobContext
         {
             if (isActive)
             {
-                job.SetProgress(progress, DateTimeOffset.UtcNow);
+                job.SetProgress(progress, timeProvider.GetUtcNow());
                 changed = true;
             }
             else
@@ -64,7 +66,7 @@ public sealed class YatkJobContext
         {
             if (isActive)
             {
-                job.SetStatusMessage(message, DateTimeOffset.UtcNow);
+                job.SetStatusMessage(message, timeProvider.GetUtcNow());
                 changed = true;
             }
             else

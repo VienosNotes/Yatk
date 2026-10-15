@@ -27,6 +27,8 @@ Yatk は、アプリケーション内で非同期ジョブを FIFO 順に実行
 - 完了済みジョブの保持上限
 - 通常ジョブより先に待機する `High` 優先度
 - 最大並列度を超えて開始する `Immediate` 優先度
+- 指定した待ち時間の経過後に実行する遅延実行
+- `TimeProvider` の差し替えによる、時刻に依存しないテスト
 
 ## 基本的な使い方
 
@@ -72,7 +74,9 @@ var jobId = scheduler.Do(async (context, cancellationToken) =>
 ## 状態の監視とキャンセル
 
 `JobChanged` は状態遷移と、進捗または状態メッセージの報告ごとに通知されます。通知は報告された順に配送され、イベント引数の `Snapshot` がその通知時点の状態を表します。
-`Snapshot.ChangedAt` には、その通知が表す変更（状態遷移、進捗・状態メッセージの報告）の発生時刻が UTC で記録されます。状態遷移の通知では、`QueuedAt`、`StartedAt`、`CompletedAt` のうち対応する時刻と同じ値になります。
+`Snapshot.ChangedAt` には、その通知が表す変更（状態遷移、進捗・状態メッセージの報告）の発生時刻が UTC で記録されます。状態遷移の通知では、`QueuedAt`、`StartedAt`、`CompletedAt` のうち対応する時刻と同じ値になります。ただし、遅延実行の `Delayed` への遷移には対応する時刻がないため、投入時刻が記録されます。
+
+`JobChanged` のハンドラが呼ばれるスレッドは保証しません。遅延実行を使う場合は、タイマーのスレッドから呼ばれることもあります。
 
 ```csharp
 scheduler.JobChanged += (_, eventArgs) =>
@@ -136,6 +140,61 @@ scheduler.Do(
 
 `Immediate` は最大並列度を超えて開始でき、連続投入による超過数に上限はありません。CPU、メモリ、外部サービスなどのリソース消費は利用者側で管理してください。ここでいう開始順は実行枠への割り当て順であり、ThreadPool 上でユーザーコードが実際に動き始める順序までは保証しません。
 
+## 遅延実行
+
+投入時に `delay` を指定すると、待ち時間が経過するまで実行しません。
+
+```csharp
+// 60 秒後に実行可能になる。
+var jobId = scheduler.Do(
+    cancellationToken => RetryAsync(cancellationToken),
+    name: "再試行",
+    delay: TimeSpan.FromSeconds(60));
+
+// 時刻が来る前なら、通常どおり取り消せる。
+scheduler.Cancel(jobId);
+```
+
+遅延を指定したジョブは、時刻が来るまで `Delayed` 状態で待ちます。`Delayed` の間は待機キューに入っておらず、最大並列度の実行枠も消費しません。
+
+- 実行可能になる時刻は、スナップショットの `NotBefore` で確認できます。
+- 時刻が来ると `Queued` へ遷移し、その時点で通常の投入と同じ扱いになります。優先度、最大並列度、キャンセルの扱いも通常のジョブと同じです。`Immediate` を指定した場合は、時刻が来た時点で最大並列度を超えて開始します。
+- `QueuedAt` には、実際に待機キューへ加わった時刻が記録されます。`Delayed` の間は `null` です。
+- FIFO の順序は、投入した順ではなく、待機キューに加わった順で決まります。複数のジョブの時刻が同時に来た場合は、`NotBefore` の早い順、同じ時刻なら投入順に加わります。
+- 実行されるのは `NotBefore` 以降であることだけを保証し、厳密な時刻の精度は保証しません。
+- `delay` が 0 以下の場合は、遅延を指定しない投入と同じ動作になります。
+
+停止時は、`Drain` と `Cancel` のどちらでも、時刻が来る前のジョブを実行せずに `Canceled` にします。`Drain` が遅延待ちのジョブの時刻まで待つことはありません。
+
+## 時刻の差し替えとテスト
+
+時刻の取得と遅延実行の待機には `TimeProvider` を使います。既定値は `TimeProvider.System` です。
+
+```csharp
+await using var scheduler = new YatkScheduler(maxConcurrency: 1, timeProvider: timeProvider);
+
+// または
+await using var scheduler = new YatkScheduler(new YatkSchedulerOptions
+{
+    TimeProvider = timeProvider,
+});
+```
+
+テストでは、`Microsoft.Extensions.TimeProvider.Testing` パッケージの `FakeTimeProvider` を渡すと、実時間を待たずに時刻を進められます。
+
+```csharp
+var time = new FakeTimeProvider();
+await using var scheduler = new YatkScheduler(timeProvider: time);
+
+var jobId = scheduler.Do(cancellationToken => WorkAsync(cancellationToken), delay: TimeSpan.FromSeconds(60));
+
+time.Advance(TimeSpan.FromSeconds(60));
+// Advance から戻った時点で、ジョブは Queued 以降に遷移している。
+await scheduler.WaitForCompletionAsync(jobId);
+```
+
+`QueuedAt`、`StartedAt`、`CompletedAt`、`ChangedAt` などの時刻も、指定した `TimeProvider` から取得します。
+
 ## リッチジョブ
 
 処理をクラスとして表現したい場合は `YatkJobBase` を継承し、`ExecuteAsync` を実装して `Enqueue` します。
@@ -160,4 +219,4 @@ public sealed class CleanupJob : YatkJobBase
 var jobId = scheduler.Enqueue(new CleanupJob());
 ```
 
-詳細な仕様と実装進捗は [docs/v1-spec.md](docs/v1-spec.md) を参照してください。
+詳細な仕様と実装進捗は [docs/v1-spec.md](docs/v1-spec.md)、[docs/v2-spec.md](docs/v2-spec.md)、[docs/v3-spec.md](docs/v3-spec.md) を参照してください。

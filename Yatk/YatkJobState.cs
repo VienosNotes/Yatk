@@ -8,6 +8,9 @@ public enum YatkJobState
     /// <summary>未投入です。</summary>
     Created,
 
+    /// <summary>実行可能になる時刻を待っています。待機キューには入っておらず、実行枠も消費しません。</summary>
+    Delayed,
+
     /// <summary>実行待ちです。</summary>
     Queued,
 

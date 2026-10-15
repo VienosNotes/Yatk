@@ -20,6 +20,14 @@ public sealed record YatkJobSnapshot(
     public YatkJobPriority Priority { get; init; } = YatkJobPriority.Normal;
 
     /// <summary>
+    /// 遅延を指定して投入された場合の、実行可能になる時刻を取得します。
+    /// </summary>
+    /// <remarks>
+    /// 遅延を指定しなかった、または 0 以下の遅延を指定したジョブでは <see langword="null"/> です。
+    /// </remarks>
+    public DateTimeOffset? NotBefore { get; init; }
+
+    /// <summary>
     /// 状態、進捗、状態メッセージのいずれかが最後に変更された時刻を取得します。
     /// </summary>
     /// <remarks>
