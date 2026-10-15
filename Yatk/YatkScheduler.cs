@@ -5,14 +5,36 @@ namespace Yatk;
 /// </summary>
 public sealed class YatkScheduler : IAsyncDisposable
 {
+    /// <summary>
+    /// タイマーに一度に設定する待ち時間の上限です。
+    /// </summary>
+    /// <remarks>
+    /// <see cref="TimeProvider.System"/> のタイマーは 0xFFFFFFFE ミリ秒（約 49.7 日）を超える待ち時間を受け付けないため、
+    /// これを超える遅延は上限で区切って待機し、発火時に残りの時間で設定し直す。
+    /// </remarks>
+    private static readonly TimeSpan MaxTimerDueTime = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
+
+    /// <summary>
+    /// タイマーに設定する待ち時間の下限です。
+    /// </summary>
+    /// <remarks>
+    /// <see cref="TimeProvider"/> の実装によっては、期限切れの待ち時間を設定するとロックを保持したままコールバックが同期的に呼ばれる。
+    /// 待ち時間を常に正にして、タイマーの設定中にコールバックが再入しないようにする。
+    /// </remarks>
+    private static readonly TimeSpan MinTimerDueTime = TimeSpan.FromMilliseconds(1);
+
     private readonly object syncRoot = new();
     private readonly LinkedList<JobEntry> queuedJobs = new();
     private readonly LinkedList<JobEntry> highPriorityQueuedJobs = new();
+    private readonly SortedSet<JobEntry> delayedJobs = new(DelayedJobComparer.Instance);
     private readonly Dictionary<YatkJobId, JobEntry> jobs = new();
     private readonly Queue<YatkJobId> completedJobIds = new();
     private readonly Queue<YatkJobSnapshot> pendingJobChanges = new();
+    private readonly TimeProvider timeProvider;
     private int maxConcurrency;
     private readonly int maxRetainedCompletedJobs;
+    private long nextSequence;
+    private ITimer? delayTimer;
     private int runningCount;
     private bool isDispatchingJobChanges;
     private Task? stopTask;
@@ -27,9 +49,14 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// 指定した最大並列度でスケジューラを初期化します。
     /// </summary>
     /// <param name="maxConcurrency">同時に実行するジョブの最大数です。</param>
+    /// <param name="timeProvider">時刻の取得と遅延実行の待機に使う <see cref="TimeProvider"/> です。<see langword="null"/> の場合は <see cref="TimeProvider.System"/> を使います。</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxConcurrency"/> が 1 未満の場合に発生します。</exception>
-    public YatkScheduler(int maxConcurrency = 1)
-        : this(new YatkSchedulerOptions { MaxConcurrency = maxConcurrency })
+    public YatkScheduler(int maxConcurrency = 1, TimeProvider? timeProvider = null)
+        : this(new YatkSchedulerOptions
+        {
+            MaxConcurrency = maxConcurrency,
+            TimeProvider = timeProvider ?? TimeProvider.System,
+        })
     {
     }
 
@@ -37,16 +64,18 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// 指定した設定でスケジューラを初期化します。
     /// </summary>
     /// <param name="options">初期設定です。</param>
-    /// <exception cref="ArgumentNullException"><paramref name="options"/> が <see langword="null"/> の場合に発生します。</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> または <see cref="YatkSchedulerOptions.TimeProvider"/> が <see langword="null"/> の場合に発生します。</exception>
     /// <exception cref="ArgumentOutOfRangeException"><see cref="YatkSchedulerOptions.MaxConcurrency"/> が 1 未満の場合に発生します。</exception>
     public YatkScheduler(YatkSchedulerOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(options.TimeProvider, nameof(options));
         ValidateMaxConcurrency(options.MaxConcurrency);
         ValidateMaxRetainedCompletedJobs(options.MaxRetainedCompletedJobs);
 
         maxConcurrency = options.MaxConcurrency;
         maxRetainedCompletedJobs = options.MaxRetainedCompletedJobs;
+        timeProvider = options.TimeProvider;
     }
 
     /// <summary>
@@ -74,17 +103,20 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// <param name="action">実行する非同期処理です。</param>
     /// <param name="name">ジョブを識別する任意の名前です。</param>
     /// <param name="priority">ジョブの実行優先度です。</param>
+    /// <param name="delay">実行可能になるまでの待ち時間です。0 以下の場合は直ちに待機キューへ加えます。</param>
     /// <returns>投入したジョブの ID です。</returns>
     /// <exception cref="ArgumentNullException"><paramref name="action"/> が <see langword="null"/> の場合に発生します。</exception>
+    /// <exception cref="ArgumentOutOfRangeException">現在時刻に <paramref name="delay"/> を加えた時刻が表現できる範囲を超える場合に発生します。</exception>
     /// <exception cref="ObjectDisposedException">スケジューラが停止済みの場合に発生します。</exception>
     public YatkJobId Do(
         Func<CancellationToken, Task> action,
         string? name = null,
-        YatkJobPriority priority = YatkJobPriority.Normal)
+        YatkJobPriority priority = YatkJobPriority.Normal,
+        TimeSpan delay = default)
     {
         ArgumentNullException.ThrowIfNull(action);
 
-        return Do((_, cancellationToken) => action(cancellationToken), name, priority);
+        return Do((_, cancellationToken) => action(cancellationToken), name, priority, delay);
     }
 
     /// <summary>
@@ -93,17 +125,20 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// <param name="action">実行する非同期処理です。</param>
     /// <param name="name">ジョブを識別する任意の名前です。</param>
     /// <param name="priority">ジョブの実行優先度です。</param>
+    /// <param name="delay">実行可能になるまでの待ち時間です。0 以下の場合は直ちに待機キューへ加えます。</param>
     /// <returns>投入したジョブの ID です。</returns>
     /// <exception cref="ArgumentNullException"><paramref name="action"/> が <see langword="null"/> の場合に発生します。</exception>
+    /// <exception cref="ArgumentOutOfRangeException">現在時刻に <paramref name="delay"/> を加えた時刻が表現できる範囲を超える場合に発生します。</exception>
     /// <exception cref="ObjectDisposedException">スケジューラが停止済みの場合に発生します。</exception>
     public YatkJobId Do(
         Func<YatkJobContext, CancellationToken, Task> action,
         string? name = null,
-        YatkJobPriority priority = YatkJobPriority.Normal)
+        YatkJobPriority priority = YatkJobPriority.Normal,
+        TimeSpan delay = default)
     {
         ArgumentNullException.ThrowIfNull(action);
 
-        return Enqueue(new DelegateJob(action, name), priority);
+        return Enqueue(new DelegateJob(action, name), priority, delay);
     }
 
     /// <summary>
@@ -111,41 +146,68 @@ public sealed class YatkScheduler : IAsyncDisposable
     /// </summary>
     /// <param name="job">実行するジョブです。</param>
     /// <param name="priority">ジョブの実行優先度です。</param>
+    /// <param name="delay">
+    /// 実行可能になるまでの待ち時間です。
+    /// 正の値を指定すると、ジョブは <see cref="YatkJobState.Delayed"/> で登録され、待ち時間の経過後に待機キューへ加わります。
+    /// 0 以下の場合は直ちに待機キューへ加えます。
+    /// </param>
     /// <returns>投入したジョブの ID です。</returns>
     /// <exception cref="ArgumentNullException"><paramref name="job"/> が <see langword="null"/> の場合に発生します。</exception>
+    /// <exception cref="ArgumentOutOfRangeException">現在時刻に <paramref name="delay"/> を加えた時刻が表現できる範囲を超える場合に発生します。</exception>
     /// <exception cref="InvalidOperationException">ジョブがすでに投入済みの場合に発生します。</exception>
     /// <exception cref="ObjectDisposedException">スケジューラが停止済みの場合に発生します。</exception>
     public YatkJobId Enqueue(
         YatkJobBase job,
-        YatkJobPriority priority = YatkJobPriority.Normal)
+        YatkJobPriority priority = YatkJobPriority.Normal,
+        TimeSpan delay = default)
     {
         ArgumentNullException.ThrowIfNull(job);
         ValidatePriority(priority);
-
-        YatkJobSnapshot snapshot;
 
         lock (syncRoot)
         {
             ThrowIfStopping();
 
-            if (!job.TryMarkQueued(DateTimeOffset.UtcNow))
+            var now = timeProvider.GetUtcNow();
+            if (delay > TimeSpan.Zero)
             {
-                throw new InvalidOperationException("同じジョブを複数回投入することはできません。");
-            }
+                if (delay > DateTimeOffset.MaxValue - now)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(delay));
+                }
 
-            var entry = new JobEntry(job, priority);
-            jobs.Add(job.JobId, entry);
-            snapshot = CreateSnapshot(entry);
-            EnqueueJobChanged(snapshot);
-            if (priority == YatkJobPriority.Immediate)
-            {
-                StartJob(entry);
+                if (!job.TryMarkDelayed(now))
+                {
+                    throw new InvalidOperationException("同じジョブを複数回投入することはできません。");
+                }
+
+                // 期限は単調な時計で判定する。NotBefore は投入時点の時計で見た予定時刻で、表示にだけ使う。
+                var nowTimestamp = timeProvider.GetTimestamp();
+                var entry = new JobEntry(job, priority, now + delay, nextSequence++)
+                {
+                    DueTimestamp = AddToTimestamp(nowTimestamp, delay),
+                };
+                jobs.Add(job.JobId, entry);
+                EnqueueJobChanged(CreateSnapshot(entry));
+                delayedJobs.Add(entry);
+
+                // 先頭が変わった場合だけ、タイマーの期限を早める必要がある。
+                if (delayedJobs.Min == entry)
+                {
+                    RescheduleDelayTimer(nowTimestamp);
+                }
             }
             else
             {
-                var queue = priority == YatkJobPriority.High ? highPriorityQueuedJobs : queuedJobs;
-                entry.QueueNode = queue.AddLast(entry);
-                StartAvailableJobs();
+                if (!job.TryMarkQueued(now))
+                {
+                    throw new InvalidOperationException("同じジョブを複数回投入することはできません。");
+                }
+
+                var entry = new JobEntry(job, priority, null, nextSequence++);
+                jobs.Add(job.JobId, entry);
+                EnqueueJobChanged(CreateSnapshot(entry));
+                AdmitQueuedJob(entry);
             }
         }
 
@@ -195,13 +257,18 @@ public sealed class YatkScheduler : IAsyncDisposable
                 return false;
             }
 
-            if (entry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
+            if (entry.Job.TryMarkCanceledBeforeRunning(timeProvider.GetUtcNow()))
             {
                 RemoveQueuedJob(entry);
+                if (delayedJobs.Remove(entry))
+                {
+                    RescheduleDelayTimer(timeProvider.GetTimestamp());
+                }
+
                 snapshot = CreateSnapshot(entry);
                 RecordCompletion(entry);
             }
-            else if (entry.Job.TryMarkCancelRequested(DateTimeOffset.UtcNow))
+            else if (entry.Job.TryMarkCancelRequested(timeProvider.GetUtcNow()))
             {
                 cancellationTokenSource = entry.CancellationTokenSource;
                 snapshot = CreateSnapshot(entry);
@@ -278,6 +345,7 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
 
         List<CancellationTokenSource>? cancellationTokenSources = null;
+        ITimer? timerToDispose = null;
         Task currentStopTask;
 
         lock (syncRoot)
@@ -286,13 +354,27 @@ public sealed class YatkScheduler : IAsyncDisposable
             {
                 stopCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
+                // どちらの停止方法でも、時刻が来る前のジョブは実行せずに取り消す。
+                foreach (var delayedEntry in delayedJobs)
+                {
+                    if (delayedEntry.Job.TryMarkCanceledBeforeRunning(timeProvider.GetUtcNow()))
+                    {
+                        EnqueueJobChanged(CreateSnapshot(delayedEntry));
+                        RecordCompletion(delayedEntry);
+                    }
+                }
+
+                delayedJobs.Clear();
+                timerToDispose = delayTimer;
+                delayTimer = null;
+
                 if (mode == YatkShutdownMode.Cancel)
                 {
                     cancellationTokenSources = new List<CancellationTokenSource>();
 
                     while (TryTakeNextQueuedJob(out var queuedEntry))
                     {
-                        if (queuedEntry.Job.TryMarkQueuedCanceled(DateTimeOffset.UtcNow))
+                        if (queuedEntry.Job.TryMarkCanceledBeforeRunning(timeProvider.GetUtcNow()))
                         {
                             EnqueueJobChanged(CreateSnapshot(queuedEntry));
                             RecordCompletion(queuedEntry);
@@ -301,7 +383,7 @@ public sealed class YatkScheduler : IAsyncDisposable
 
                     foreach (var entry in jobs.Values)
                     {
-                        if (entry.Job.TryMarkCancelRequested(DateTimeOffset.UtcNow))
+                        if (entry.Job.TryMarkCancelRequested(timeProvider.GetUtcNow()))
                         {
                             EnqueueJobChanged(CreateSnapshot(entry));
                             cancellationTokenSources.Add(entry.CancellationTokenSource);
@@ -319,6 +401,8 @@ public sealed class YatkScheduler : IAsyncDisposable
 
             currentStopTask = stopTask;
         }
+
+        timerToDispose?.Dispose();
 
         if (cancellationTokenSources is not null)
         {
@@ -348,6 +432,7 @@ public sealed class YatkScheduler : IAsyncDisposable
         {
             await entry.Job.ExecuteInternalAsync(
                     entry.CancellationTokenSource.Token,
+                    timeProvider,
                     () => OnJobReported(entry))
                 .ConfigureAwait(false);
             MarkSucceeded(entry);
@@ -369,6 +454,143 @@ public sealed class YatkScheduler : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// <see cref="YatkJobState.Queued"/> になったジョブを、優先度に応じて開始または待機キューへ追加します。
+    /// </summary>
+    /// <remarks>
+    /// 呼び出し元は <see cref="syncRoot"/> を保持している必要があります。
+    /// </remarks>
+    private void AdmitQueuedJob(JobEntry entry)
+    {
+        if (entry.Priority == YatkJobPriority.Immediate)
+        {
+            StartJob(entry);
+        }
+        else
+        {
+            var queue = entry.Priority == YatkJobPriority.High ? highPriorityQueuedJobs : queuedJobs;
+            entry.QueueNode = queue.AddLast(entry);
+            StartAvailableJobs();
+        }
+    }
+
+    /// <summary>
+    /// 遅延待ちのタイマーが発火したときに、時刻が来たジョブを待機キューへ加えます。
+    /// </summary>
+    /// <remarks>
+    /// タイマーは 1 つだけで、発火しても先頭のジョブの期限が来たとは限りません
+    /// （設定し直す前のコールバックが遅れて届いた場合や、長い遅延を上限で区切って待っている場合など）。
+    /// そのため、発火のたびに <see cref="TimeProvider.GetTimestamp"/> で期限を判定し直し、
+    /// 期限が来たジョブだけを待機キューへ加えて、残りのジョブに合わせてタイマーを設定し直します。
+    /// 判定には単調な時計を使うため、システム時刻が戻っても実行は遅れず、進んでも早まりません。
+    /// </remarks>
+    private void OnDelayTimerFired()
+    {
+        // TimeProvider によっては、GetUtcNow などの呼び出し中にタイマーのコールバックを同期的に呼ぶ（FakeTimeProvider など）。
+        // スケジューラのロック内で再入した場合に処理すると、呼び出し元の操作の途中で状態を変更してしまうため、ThreadPool で処理し直す。
+        if (Monitor.IsEntered(syncRoot))
+        {
+            ThreadPool.UnsafeQueueUserWorkItem(_ => OnDelayTimerFired(), null);
+            return;
+        }
+
+        lock (syncRoot)
+        {
+            // 停止後に遅れて発火した場合、遅延待ちのジョブはすでに取り消されている。
+            if (stopTask is not null)
+            {
+                return;
+            }
+
+            var nowTimestamp = timeProvider.GetTimestamp();
+            var now = timeProvider.GetUtcNow();
+
+            // 期限と投入順で整列しているため、先頭から取り出すことで順序を保つ。
+            while (delayedJobs.Min is { } entry && entry.DueTimestamp <= nowTimestamp)
+            {
+                delayedJobs.Remove(entry);
+                if (entry.Job.TryMarkReady(now))
+                {
+                    EnqueueJobChanged(CreateSnapshot(entry));
+                    AdmitQueuedJob(entry);
+                }
+            }
+
+            RescheduleDelayTimer(nowTimestamp);
+        }
+
+        DispatchJobChanges();
+    }
+
+    /// <summary>
+    /// 遅延待ちの先頭ジョブの期限に合わせて、タイマーを設定し直します。
+    /// </summary>
+    /// <remarks>
+    /// 呼び出し元は <see cref="syncRoot"/> を保持している必要があります。
+    /// </remarks>
+    private void RescheduleDelayTimer(long nowTimestamp)
+    {
+        if (delayedJobs.Min is not { } next)
+        {
+            delayTimer?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            return;
+        }
+
+        // 期限より前に発火しないよう、切り上げて TimeSpan の刻みへ変換する。
+        var remainingTicks = CeilingDivide(
+            ((Int128)next.DueTimestamp - nowTimestamp) * TimeSpan.TicksPerSecond,
+            timeProvider.TimestampFrequency);
+        TimeSpan dueTime;
+        if (remainingTicks < MinTimerDueTime.Ticks)
+        {
+            dueTime = MinTimerDueTime;
+        }
+        else if (remainingTicks > MaxTimerDueTime.Ticks)
+        {
+            dueTime = MaxTimerDueTime;
+        }
+        else
+        {
+            dueTime = TimeSpan.FromTicks((long)remainingTicks);
+        }
+
+        if (delayTimer is null)
+        {
+            // スケジューラが存続する間、最初の投入元の ExecutionContext をタイマーに保持させない。
+            using (ExecutionContext.SuppressFlow())
+            {
+                delayTimer = timeProvider.CreateTimer(
+                    _ => OnDelayTimerFired(),
+                    null,
+                    Timeout.InfiniteTimeSpan,
+                    Timeout.InfiniteTimeSpan);
+            }
+        }
+
+        delayTimer.Change(dueTime, Timeout.InfiniteTimeSpan);
+    }
+
+    /// <summary>
+    /// 単調な時計のタイムスタンプに、待ち時間を加えた期限を求めます。
+    /// </summary>
+    /// <remarks>
+    /// 期限より前に実行しないよう、待ち時間はタイムスタンプの刻みへ切り上げて変換します。
+    /// 表現できない遠い期限は <see cref="long.MaxValue"/> に丸めます。この場合、ジョブは停止または取り消しまで実行されません。
+    /// </remarks>
+    private long AddToTimestamp(long timestamp, TimeSpan delay)
+    {
+        var due = timestamp + CeilingDivide(
+            (Int128)delay.Ticks * timeProvider.TimestampFrequency,
+            TimeSpan.TicksPerSecond);
+        return due > long.MaxValue ? long.MaxValue : (long)due;
+    }
+
+    private static Int128 CeilingDivide(Int128 dividend, long divisor)
+    {
+        var (quotient, remainder) = Int128.DivRem(dividend, divisor);
+        return remainder > 0 ? quotient + 1 : quotient;
+    }
+
     private void StartAvailableJobs()
     {
         while (runningCount < maxConcurrency && TryTakeNextQueuedJob(out var entry))
@@ -379,7 +601,7 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     private void StartJob(JobEntry entry)
     {
-        if (!entry.Job.TryMarkRunning(DateTimeOffset.UtcNow))
+        if (!entry.Job.TryMarkRunning(timeProvider.GetUtcNow()))
         {
             return;
         }
@@ -422,7 +644,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         lock (syncRoot)
         {
-            entry.Job.MarkSucceeded(DateTimeOffset.UtcNow);
+            entry.Job.MarkSucceeded(timeProvider.GetUtcNow());
             var snapshot = CreateSnapshot(entry);
             RecordCompletion(entry);
             EnqueueJobChanged(snapshot);
@@ -433,7 +655,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         lock (syncRoot)
         {
-            if (!entry.Job.TryMarkCanceledAfterCancellation(DateTimeOffset.UtcNow))
+            if (!entry.Job.TryMarkCanceledAfterCancellation(timeProvider.GetUtcNow()))
             {
                 return;
             }
@@ -448,7 +670,7 @@ public sealed class YatkScheduler : IAsyncDisposable
     {
         lock (syncRoot)
         {
-            entry.Job.MarkFailed(DateTimeOffset.UtcNow, exception);
+            entry.Job.MarkFailed(timeProvider.GetUtcNow(), exception);
             var snapshot = CreateSnapshot(entry);
             RecordCompletion(entry);
             EnqueueJobChanged(snapshot);
@@ -500,6 +722,12 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     private void RecordCompletion(JobEntry entry)
     {
+        // 完了済みジョブの保持期間中に、クロージャが捕捉したオブジェクトを残さない。
+        if (entry.Job is DelegateJob delegateJob)
+        {
+            delegateJob.ReleaseAction();
+        }
+
         completedJobIds.Enqueue(entry.Job.JobId);
 
         while (completedJobIds.Count > maxRetainedCompletedJobs)
@@ -650,12 +878,16 @@ public sealed class YatkScheduler : IAsyncDisposable
 
     private static YatkJobSnapshot CreateSnapshot(JobEntry entry)
     {
-        return entry.Job.CreateSnapshot() with { Priority = entry.Priority };
+        return entry.Job.CreateSnapshot() with
+        {
+            Priority = entry.Priority,
+            NotBefore = entry.NotBefore,
+        };
     }
 
     private sealed class DelegateJob : YatkJobBase
     {
-        private readonly Func<YatkJobContext, CancellationToken, Task> action;
+        private Func<YatkJobContext, CancellationToken, Task>? action;
 
         public DelegateJob(Func<YatkJobContext, CancellationToken, Task> action, string? name)
             : base(name)
@@ -663,18 +895,36 @@ public sealed class YatkScheduler : IAsyncDisposable
             this.action = action;
         }
 
+        /// <summary>
+        /// 実行されずに終了状態になったジョブのデリゲートへの参照を解放します。
+        /// </summary>
+        /// <remarks>
+        /// 終了状態になった後は実行されないため、実行中のスレッドと競合しない。
+        /// </remarks>
+        public void ReleaseAction()
+        {
+            action = null;
+        }
+
         protected override Task ExecuteAsync(YatkJobContext context, CancellationToken cancellationToken)
         {
-            return action(context, cancellationToken);
+            // ジョブは一度だけ実行されるため、開始時点でフィールドからの参照を手放す。
+            // これにより、完了の通知より前にデリゲートが解放される。
+            // 実行前に終了状態になったジョブは実行されないため、ここでは解放されていない。
+            var currentAction = action!;
+            action = null;
+            return currentAction(context, cancellationToken);
         }
     }
 
     private sealed class JobEntry
     {
-        public JobEntry(YatkJobBase job, YatkJobPriority priority)
+        public JobEntry(YatkJobBase job, YatkJobPriority priority, DateTimeOffset? notBefore, long sequence)
         {
             Job = job;
             Priority = priority;
+            NotBefore = notBefore;
+            Sequence = sequence;
             CancellationTokenSource = new CancellationTokenSource();
         }
 
@@ -682,8 +932,52 @@ public sealed class YatkScheduler : IAsyncDisposable
 
         public YatkJobPriority Priority { get; }
 
+        /// <summary>
+        /// 遅延を指定して投入された場合の、実行可能になる時刻です。
+        /// </summary>
+        public DateTimeOffset? NotBefore { get; }
+
+        /// <summary>
+        /// 遅延を指定して投入された場合の、実行可能になる期限です。<see cref="TimeProvider.GetTimestamp"/> の単調な時計で表します。
+        /// </summary>
+        public long DueTimestamp { get; init; }
+
+        /// <summary>
+        /// 投入順を表す連番です。同じ <see cref="DueTimestamp"/> のジョブを投入順に並べるために使います。
+        /// </summary>
+        public long Sequence { get; }
+
         public CancellationTokenSource CancellationTokenSource { get; }
 
         public LinkedListNode<JobEntry>? QueueNode { get; set; }
+    }
+
+    /// <summary>
+    /// 遅延待ちのジョブを、単調な時計で表した期限、投入順の順に並べる比較子です。
+    /// </summary>
+    private sealed class DelayedJobComparer : IComparer<JobEntry>
+    {
+        public static readonly DelayedJobComparer Instance = new();
+
+        public int Compare(JobEntry? x, JobEntry? y)
+        {
+            if (ReferenceEquals(x, y))
+            {
+                return 0;
+            }
+
+            if (x is null)
+            {
+                return -1;
+            }
+
+            if (y is null)
+            {
+                return 1;
+            }
+
+            var result = x.DueTimestamp.CompareTo(y.DueTimestamp);
+            return result != 0 ? result : x.Sequence.CompareTo(y.Sequence);
+        }
     }
 }

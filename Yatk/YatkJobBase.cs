@@ -103,6 +103,38 @@ public abstract class YatkJobBase
         }
     }
 
+    internal bool TryMarkDelayed(DateTimeOffset timestamp)
+    {
+        lock (syncRoot)
+        {
+            if (state != YatkJobState.Created)
+            {
+                return false;
+            }
+
+            // 待機キューにはまだ加わっていないため、QueuedAt は記録しない。
+            state = YatkJobState.Delayed;
+            changedAt = timestamp;
+            return true;
+        }
+    }
+
+    internal bool TryMarkReady(DateTimeOffset timestamp)
+    {
+        lock (syncRoot)
+        {
+            if (state != YatkJobState.Delayed)
+            {
+                return false;
+            }
+
+            state = YatkJobState.Queued;
+            queuedAt = timestamp;
+            changedAt = timestamp;
+            return true;
+        }
+    }
+
     internal bool TryMarkRunning(DateTimeOffset timestamp)
     {
         lock (syncRoot)
@@ -134,11 +166,11 @@ public abstract class YatkJobBase
         }
     }
 
-    internal bool TryMarkQueuedCanceled(DateTimeOffset timestamp)
+    internal bool TryMarkCanceledBeforeRunning(DateTimeOffset timestamp)
     {
         lock (syncRoot)
         {
-            if (state != YatkJobState.Queued)
+            if (state is not (YatkJobState.Delayed or YatkJobState.Queued))
             {
                 return false;
             }
@@ -191,9 +223,9 @@ public abstract class YatkJobBase
         }
     }
 
-    internal async Task ExecuteInternalAsync(CancellationToken cancellationToken, Action jobChanged)
+    internal async Task ExecuteInternalAsync(CancellationToken cancellationToken, TimeProvider timeProvider, Action jobChanged)
     {
-        var context = new YatkJobContext(this, jobChanged);
+        var context = new YatkJobContext(this, timeProvider, jobChanged);
 
         try
         {
